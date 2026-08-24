@@ -12,6 +12,9 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Download matching chromium binaries for the installed python package
+RUN playwright install chromium
+
 # Application code copy karein
 COPY . .
 
