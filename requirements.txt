@@ -1,6 +1,6 @@
 boto3
 python-dotenv
-playwright
+playwright==1.40.0
 requests
 pymongo
 flask
