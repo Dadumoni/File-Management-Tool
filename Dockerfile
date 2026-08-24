@@ -1,48 +1,22 @@
-FROM python:3.10-slim
+FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
 
-# System dependencies aur FFmpeg install karein
+# System updates aur FFmpeg install karein
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     curl \
-    wget \
-    gnupg \
-    libglib2.0-0 \
-    libnss3 \
-    libnspr4 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libdbus-1-3 \
-    libxcb1 \
-    libxkbcommon0 \
-    libx11-6 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    librandr2 \
-    libgbm1 \
-    libpango-1.0-0 \
-    libcairo2 \
-    libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
-# Requirements install karein
+# Requirements copy aur install karein
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Playwright Chromium browser install karein
-RUN playwright install chromium
-RUN playwright install-deps chromium
-
-# Code copy karein
+# Application code copy karein
 COPY . .
 
-# Koyeb Health Check Port Expose karein
+# Koyeb Health Check Port
 EXPOSE 8080
 
-# Script run karein
+# Script start karein
 CMD ["python", "main.py"]
