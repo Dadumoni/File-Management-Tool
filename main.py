@@ -60,8 +60,6 @@ VIDEO_EXTENSIONS = {
     ".ts", ".3gp", ".ogv", ".vob",
 }
 
-THUMB_TIMESTAMPS = ["00:00:00.000", "00:00:02.000", "00:00:05.000"]
-
 
 # ============================================================
 # LOGGING
@@ -278,28 +276,82 @@ def make_rename(ext):
 # THUMBNAIL GENERATION & UPLOAD
 # ============================================================
 
+def get_video_duration(video_path: Path) -> float:
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-show_entries", "format=duration",
+        "-of", "default=noprint_wrappers=1:nokey=1",
+        str(video_path)
+    ]
+    try:
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return float(res.stdout.strip())
+    except Exception as e:
+        log(f"Failed to get video duration: {e}")
+        return 0.0
+
 def generate_thumbnails(video_path: Path, slug: str, temp_dir: Path):
     thumbs = []
-    for i, ts in enumerate(THUMB_TIMESTAMPS, start=1):
-        thumb_path = temp_dir / f"{slug}_thumb_{i}.jpg"
-        cmd = [
+
+    # --- Thumbnail 1: First Frame ---
+    thumb1_path = temp_dir / f"{slug}_thumb_1.jpg"
+    cmd1 = [
+        "ffmpeg", "-y", "-ss", "00:00:00.000",
+        "-i", str(video_path), "-vframes", "1", "-q:v", "2",
+        str(thumb1_path)
+    ]
+    subprocess.run(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if thumb1_path.exists():
+        log(f"Thumbnail 1 generated: {thumb1_path.name}")
+        thumbs.append(thumb1_path)
+    else:
+        thumbs.append(None)
+
+    # --- Thumbnail 2: Frame at 2 Seconds ---
+    thumb2_path = temp_dir / f"{slug}_thumb_2.jpg"
+    cmd2 = [
+        "ffmpeg", "-y", "-ss", "00:00:02.000",
+        "-i", str(video_path), "-vframes", "1", "-q:v", "2",
+        str(thumb2_path)
+    ]
+    res2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if res2.returncode != 0 or not thumb2_path.exists():
+        cmd2[3] = "00:00:00.000"
+        subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    if thumb2_path.exists():
+        log(f"Thumbnail 2 generated: {thumb2_path.name}")
+        thumbs.append(thumb2_path)
+    else:
+        thumbs.append(None)
+
+    # --- Thumbnail 3: 3x3 Grid Montage (9 Equal Intervals) ---
+    thumb3_path = temp_dir / f"{slug}_thumb_3.jpg"
+    duration = get_video_duration(video_path)
+
+    if duration > 0:
+        interval = duration / 9.0
+        select_expr = "+".join([f"gte(t\\,{i * interval:.2f})" for i in range(9)])
+        vf_filter = f"select='{select_expr}',tile=3x3"
+        
+        cmd3 = [
             "ffmpeg", "-y",
-            "-ss", ts,
             "-i", str(video_path),
+            "-vf", vf_filter,
             "-vframes", "1",
             "-q:v", "2",
-            str(thumb_path),
+            str(thumb3_path)
         ]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        if res.returncode != 0 or not thumb_path.exists():
-            cmd[3] = "00:00:00.000"
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-
-        if thumb_path.exists():
-            log(f"Thumbnail {i} generated: {thumb_path.name}")
-            thumbs.append(thumb_path)
+        res3 = subprocess.run(cmd3, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res3.returncode == 0 and thumb3_path.exists():
+            log(f"Thumbnail 3 (3x3 Grid) generated: {thumb3_path.name}")
+            thumbs.append(thumb3_path)
         else:
+            log("Failed to generate 3x3 grid thumbnail.")
             thumbs.append(None)
+    else:
+        thumbs.append(None)
+
     return thumbs
 
 def upload_thumb_to_r2(s3, thumb_path: Path, slug: str, index: int):
