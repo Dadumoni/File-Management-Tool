@@ -27,23 +27,23 @@ from requests_toolbelt.multipart.encoder import MultipartEncoder
 
 load_dotenv()
 
-R2_ENDPOINT    = os.getenv("R2_ENDPOINT")
-R2_ACCESS_KEY  = os.getenv("R2_ACCESS_KEY")
-R2_SECRET_KEY  = os.getenv("R2_SECRET_KEY")
-R2_BUCKET      = os.getenv("R2_BUCKET")
-R2_PUBLIC_URL  = os.getenv("R2_PUBLIC_URL", "").rstrip("/")
+R2_ENDPOINT     = os.getenv("R2_ENDPOINT")
+R2_ACCESS_KEY   = os.getenv("R2_ACCESS_KEY")
+R2_SECRET_KEY   = os.getenv("R2_SECRET_KEY")
+R2_BUCKET       = os.getenv("R2_BUCKET")
+R2_PUBLIC_URL   = os.getenv("R2_PUBLIC_URL", "").rstrip("/")
 R2_WATCH_FOLDER = os.getenv("R2_WATCH_FOLDER", "uploads/")
 
 ZEROSTORAGE_API_KEY = os.getenv("ZEROSTORAGE_API_KEY")
 
-CF_ACCOUNT_ID  = os.getenv("CF_ACCOUNT_ID")
-CF_API_TOKEN   = os.getenv("CF_API_TOKEN")
-D1_DATABASE_ID = os.getenv("D1_DATABASE_ID")
+CF_ACCOUNT_ID   = os.getenv("CF_ACCOUNT_ID")
+CF_API_TOKEN    = os.getenv("CF_API_TOKEN")
+D1_DATABASE_ID  = os.getenv("D1_DATABASE_ID")
 
-MONGO_URI      = os.getenv("MONGO_URI", "mongodb://localhost:27017")
-MONGO_DB_NAME  = os.getenv("MONGO_DB_NAME", "video_bot_db")
+MONGO_URI       = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_DB_NAME   = os.getenv("MONGO_DB_NAME", "video_bot_db")
 
-APP_URL        = os.getenv("APP_URL", "")
+APP_URL         = os.getenv("APP_URL", "")
 
 ANONMP4_URL      = "https://anonmp4.to"
 ABYSS_UPLOAD_URL = "http://up.hydrax.net/9e805aa56a78e2abd1be605e7af7b3cb"
@@ -107,8 +107,8 @@ def validate_config():
         "R2_BUCKET":          R2_BUCKET,
         "ZEROSTORAGE_API_KEY": ZEROSTORAGE_API_KEY,
         "CF_ACCOUNT_ID":      CF_ACCOUNT_ID,
-        "CF_API_TOKEN":       CF_API_TOKEN,
-        "D1_DATABASE_ID":     D1_DATABASE_ID,
+        "CF_API_TOKEN":        CF_API_TOKEN,
+        "D1_DATABASE_ID":      D1_DATABASE_ID,
     }
     missing = [k for k, v in required.items() if not v]
     if missing:
@@ -293,11 +293,21 @@ def get_video_duration(video_path: Path) -> float:
 def generate_thumbnails(video_path: Path, slug: str, temp_dir: Path):
     thumbs = []
 
-    # --- Thumbnail 1: First Frame ---
+    # Aspect ratio & Blur Padding Filter for single frames (1280x720)
+    blur_pad_16_9 = (
+        "[0:v]split=2[bg][fg];"
+        "[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,boxblur=20:5[blurred];"
+        "[fg]scale=1280:720:force_original_aspect_ratio=decrease[scaled];"
+        "[blurred][scaled]overlay=(W-w)/2:(H-h)/2"
+    )
+
+    # --- Thumbnail 1: First Frame (16:9 with Blur Padding) ---
     thumb1_path = temp_dir / f"{slug}_thumb_1.jpg"
     cmd1 = [
         "ffmpeg", "-y", "-ss", "00:00:00.000",
-        "-i", str(video_path), "-vframes", "1", "-q:v", "2",
+        "-i", str(video_path),
+        "-vf", blur_pad_16_9,
+        "-vframes", "1", "-q:v", "2",
         str(thumb1_path)
     ]
     subprocess.run(cmd1, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -307,11 +317,13 @@ def generate_thumbnails(video_path: Path, slug: str, temp_dir: Path):
     else:
         thumbs.append(None)
 
-    # --- Thumbnail 2: Frame at 2 Seconds ---
+    # --- Thumbnail 2: Frame at 2 Seconds (16:9 with Blur Padding) ---
     thumb2_path = temp_dir / f"{slug}_thumb_2.jpg"
     cmd2 = [
         "ffmpeg", "-y", "-ss", "00:00:02.000",
-        "-i", str(video_path), "-vframes", "1", "-q:v", "2",
+        "-i", str(video_path),
+        "-vf", blur_pad_16_9,
+        "-vframes", "1", "-q:v", "2",
         str(thumb2_path)
     ]
     res2 = subprocess.run(cmd2, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
@@ -325,26 +337,39 @@ def generate_thumbnails(video_path: Path, slug: str, temp_dir: Path):
     else:
         thumbs.append(None)
 
-    # --- Thumbnail 3: 3x3 Grid Montage (9 Equal Intervals) ---
+    # --- Thumbnail 3: 3x3 Grid (Uncropped frames + 16:9 Blur Padding) ---
     thumb3_path = temp_dir / f"{slug}_thumb_3.jpg"
     duration = get_video_duration(video_path)
 
     if duration > 0:
-        interval = duration / 9.0
-        select_expr = "+".join([f"gte(t\\,{i * interval:.2f})" for i in range(9)])
-        vf_filter = f"select='{select_expr}',tile=3x3"
+        interval = duration / 10.0
+        select_expr = "+".join([f"between(t\\,{i * interval:.2f}\\,{i * interval + 0.1:.2f})" for i in range(1, 10)])
         
+        # 1. Scale each frame inside 426x240 slot without cropping
+        # 2. Arrange 9 frames into 3x3 grid (Total ~1278x720)
+        # 3. Apply blurred background padding to ensure a clean 16:9 container
+        grid_filter = (
+            f"select='{select_expr}',"
+            f"scale=426:240:force_original_aspect_ratio=decrease,"
+            f"pad=426:240:(ow-iw)/2:(oh-ih)/2:black,"
+            f"tile=3x3[grid];"
+            f"[grid]split=2[bg][fg];"
+            f"[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,boxblur=20:5[blurred];"
+            f"[fg]scale=1280:720:force_original_aspect_ratio=decrease[scaled];"
+            f"[blurred][scaled]overlay=(W-w)/2:(H-h)/2"
+        )
+
         cmd3 = [
             "ffmpeg", "-y",
             "-i", str(video_path),
-            "-vf", vf_filter,
+            "-vf", grid_filter,
             "-vframes", "1",
             "-q:v", "2",
             str(thumb3_path)
         ]
         res3 = subprocess.run(cmd3, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if res3.returncode == 0 and thumb3_path.exists():
-            log(f"Thumbnail 3 (3x3 Grid) generated: {thumb3_path.name}")
+            log(f"Thumbnail 3 (Uncropped 3x3 Grid 16:9) generated: {thumb3_path.name}")
             thumbs.append(thumb3_path)
         else:
             log("Failed to generate 3x3 grid thumbnail.")
@@ -577,8 +602,8 @@ def process_video(s3, page, video: dict, temp_dir: Path, processed_titles: set):
             "thumbnail_3": thumb_urls[2],
             "video_link":  zs_video,
             "zerostorage": zs_embed,
-            "abyss":       abyss_url,
-            "anonmp4":     anon_url,
+            "abyss":        abyss_url,
+            "anonmp4":      anon_url,
         }
         d1_insert_video(record)
         save_file_hash(file_hash, slug, new_name)
