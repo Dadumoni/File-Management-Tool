@@ -296,7 +296,7 @@ def generate_thumbnails(video_path: Path, slug: str, temp_dir: Path):
     # Aspect ratio & Blur Padding Filter for single frames (1280x720)
     blur_pad_16_9 = (
         "[0:v]split=2[bg][fg];"
-        "[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,boxblur=20:5[blurred];"
+        "[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,boxblur=25:10[blurred];"
         "[fg]scale=1280:720:force_original_aspect_ratio=decrease[scaled];"
         "[blurred][scaled]overlay=(W-w)/2:(H-h)/2"
     )
@@ -337,26 +337,19 @@ def generate_thumbnails(video_path: Path, slug: str, temp_dir: Path):
     else:
         thumbs.append(None)
 
-    # --- Thumbnail 3: 3x3 Grid (Uncropped frames + 16:9 Blur Padding) ---
+    # --- Thumbnail 3: Exact 9-Frame 3x3 Grid (Uncropped + 16:9 Blurred Background) ---
     thumb3_path = temp_dir / f"{slug}_thumb_3.jpg"
     duration = get_video_duration(video_path)
 
     if duration > 0:
-        interval = duration / 10.0
-        select_expr = "+".join([f"between(t\\,{i * interval:.2f}\\,{i * interval + 0.1:.2f})" for i in range(1, 10)])
-        
-        # 1. Scale each frame inside 426x240 slot without cropping
-        # 2. Arrange 9 frames into 3x3 grid (Total ~1278x720)
-        # 3. Apply blurred background padding to ensure a clean 16:9 container
+        # fps=9/{duration} guarantees exact 9 frames extracted across video length
         grid_filter = (
-            f"select='{select_expr}',"
+            f"fps=9/{duration},"
             f"scale=426:240:force_original_aspect_ratio=decrease,"
-            f"pad=426:240:(ow-iw)/2:(oh-ih)/2:black,"
+            f"pad=426:240:(ow-iw)/2:(oh-ih)/2:color=black@0,"
             f"tile=3x3[grid];"
-            f"[grid]split=2[bg][fg];"
-            f"[bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,boxblur=20:5[blurred];"
-            f"[fg]scale=1280:720:force_original_aspect_ratio=decrease[scaled];"
-            f"[blurred][scaled]overlay=(W-w)/2:(H-h)/2"
+            f"[0:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,boxblur=30:10[bg];"
+            f"[bg][grid]overlay=(W-w)/2:(H-h)/2"
         )
 
         cmd3 = [
@@ -369,7 +362,7 @@ def generate_thumbnails(video_path: Path, slug: str, temp_dir: Path):
         ]
         res3 = subprocess.run(cmd3, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         if res3.returncode == 0 and thumb3_path.exists():
-            log(f"Thumbnail 3 (Uncropped 3x3 Grid 16:9) generated: {thumb3_path.name}")
+            log(f"Thumbnail 3 (Exact 9-Grid 16:9 Blurred) generated: {thumb3_path.name}")
             thumbs.append(thumb3_path)
         else:
             log("Failed to generate 3x3 grid thumbnail.")
