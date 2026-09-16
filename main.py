@@ -301,7 +301,7 @@ def generate_thumbnails(video_path: Path, slug: str, temp_dir: Path):
         "[blurred][scaled]overlay=(W-w)/2:(H-h)/2"
     )
 
-    # --- Thumbnail 1: First Frame (16:9 with Blur Padding) ---
+    # --- Thumbnail 1: First Frame ---
     thumb1_path = temp_dir / f"{slug}_thumb_1.jpg"
     cmd1 = [
         "ffmpeg", "-y", "-ss", "00:00:00.000",
@@ -317,7 +317,7 @@ def generate_thumbnails(video_path: Path, slug: str, temp_dir: Path):
     else:
         thumbs.append(None)
 
-    # --- Thumbnail 2: Frame at 2 Seconds (16:9 with Blur Padding) ---
+    # --- Thumbnail 2: Frame at 2 Seconds ---
     thumb2_path = temp_dir / f"{slug}_thumb_2.jpg"
     cmd2 = [
         "ffmpeg", "-y", "-ss", "00:00:02.000",
@@ -337,30 +337,55 @@ def generate_thumbnails(video_path: Path, slug: str, temp_dir: Path):
     else:
         thumbs.append(None)
 
-    # --- Thumbnail 3: Exact 9-Frame 3x3 Grid (Uncropped + 16:9 Blurred Background) ---
+    # --- Thumbnail 3: Exact 9 Frames 3x3 Grid (Uncropped + 16:9 Blurred Background) ---
     thumb3_path = temp_dir / f"{slug}_thumb_3.jpg"
     duration = get_video_duration(video_path)
 
     if duration > 0:
-        # fps=9/{duration} guarantees exact 9 frames extracted across video length
+        step = duration / 9.0
+        # Select exact 9 frames across video length, pad each slot without cropping,
+        # compile 3x3 grid and overlay on top of blurred video background
         grid_filter = (
-            f"fps=9/{duration},"
+            f"[0:v]split=2[v_grid][v_bg];"
+            f"[v_grid]select='between(t,0,{duration})*not(mod(n\,max(1\,floor(N/9))))',"
             f"scale=426:240:force_original_aspect_ratio=decrease,"
-            f"pad=426:240:(ow-iw)/2:(oh-ih)/2:color=black@0,"
+            f"pad=426:240:(ow-iw)/2:(oh-ih)/2:color=black,"
             f"tile=3x3[grid];"
-            f"[0:v]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,boxblur=30:10[bg];"
+            f"[v_bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,boxblur=30:10[bg];"
             f"[bg][grid]overlay=(W-w)/2:(H-h)/2"
         )
 
         cmd3 = [
             "ffmpeg", "-y",
             "-i", str(video_path),
-            "-vf", grid_filter,
+            "-filter_complex", grid_filter,
             "-vframes", "1",
             "-q:v", "2",
             str(thumb3_path)
         ]
         res3 = subprocess.run(cmd3, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        # Fallback filter in case frame count evaluation fails on shorter clips
+        if res3.returncode != 0 or not thumb3_path.exists():
+            fallback_filter = (
+                f"[0:v]split=2[v_grid][v_bg];"
+                f"[v_grid]fps=9/{duration},"
+                f"scale=426:240:force_original_aspect_ratio=decrease,"
+                f"pad=426:240:(ow-iw)/2:(oh-ih)/2:color=black,"
+                f"tile=3x3[grid];"
+                f"[v_bg]scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,boxblur=30:10[bg];"
+                f"[bg][grid]overlay=(W-w)/2:(H-h)/2"
+            )
+            cmd3_fallback = [
+                "ffmpeg", "-y",
+                "-i", str(video_path),
+                "-filter_complex", fallback_filter,
+                "-vframes", "1",
+                "-q:v", "2",
+                str(thumb3_path)
+            ]
+            res3 = subprocess.run(cmd3_fallback, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
         if res3.returncode == 0 and thumb3_path.exists():
             log(f"Thumbnail 3 (Exact 9-Grid 16:9 Blurred) generated: {thumb3_path.name}")
             thumbs.append(thumb3_path)
@@ -441,7 +466,6 @@ def upload_anonmp4_with_retry(page, file_path: Path):
                 time.sleep(attempt * 5)
     raise last_err
 
-# ZERO-MEMORY STREAMED ABYSS UPLOAD (OOM FIX)
 def upload_abyss(video_path: Path):
     log("[Abyss] Uploading (Streamed mode)...")
     file_type = mimetypes.guess_type(str(video_path))[0] or "video/mp4"
@@ -486,7 +510,6 @@ def upload_zerostorage(video_path: Path):
     log(f"[ZeroStorage] Uploading {file_name} ({file_size / 1024 / 1024:.2f} MB)")
     upload_url = "https://zerostorage.net/api/upload/chunked"
     uploaded = 0
-    start_time = time.time()
     file_id = None
 
     with open(file_path, "rb") as f:
@@ -512,7 +535,7 @@ def upload_zerostorage(video_path: Path):
                         timeout=300,
                     )
                     break
-                except requests.exceptions.RequestException as e:
+                except requests.exceptions.RequestException:
                     if attempt == MAX_RETRIES:
                         raise
                     time.sleep(attempt * 3)
@@ -550,7 +573,7 @@ def process_video(s3, page, video: dict, temp_dir: Path, processed_titles: set):
     log("=" * 65)
 
     slug = d1_get_next_slug()
-    new_name = make_rename(orig_ext)  # Original extension intact!
+    new_name = make_rename(orig_ext)
     local_file = temp_dir / new_name
 
     try:
