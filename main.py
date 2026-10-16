@@ -769,10 +769,7 @@ def process_video(s3_source, s3_dest, page, video: dict, temp_dir: Path, process
         record = {
             "slug":        slug,
             "title":       new_name,
-            "thumbnail_1": thumb_path_rel,
             "thumbnail":   thumb_path_rel,
-            "thumbnail_2": None,
-            "thumbnail_3": None,
             "video_link":  zs_video,
             "zerostorage": zs_embed,
             "abyss":       abyss_url,
