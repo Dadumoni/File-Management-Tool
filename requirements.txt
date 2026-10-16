@@ -5,3 +5,4 @@ requests
 requests-toolbelt
 pymongo
 flask
+Pillow
