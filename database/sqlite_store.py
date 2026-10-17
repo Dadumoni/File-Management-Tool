@@ -1,4 +1,5 @@
 import os
+import math
 import sqlite3
 import time
 import threading
@@ -254,78 +255,118 @@ def get_counts():
     finally:
         conn.close()
 
-def list_directory_from_db(prefix=""):
+def list_directory_from_db(prefix="", page=1, limit=36, search=""):
     """
-    Returns files and immediate subfolders under prefix directly from SQLite.
+    Returns files (paginated) and immediate subfolders under prefix directly from SQLite.
     """
     prefix = (prefix or "").strip()
     if prefix and not prefix.endswith("/"):
         prefix += "/"
 
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 36), 500))
+    offset = (page - 1) * limit
+    search = (search or "").strip()
+
     conn = get_connection()
     try:
-        # Fetch all items in this folder or deeper
-        rows = conn.execute(
-            "SELECT key, filename, folder, ext, file_type, size, last_modified, direct_url, stream_url FROM media_items WHERE bucket_type='source' AND key LIKE ? ORDER BY filename ASC",
+        # 1. Fetch distinct folders that start with prefix
+        folder_rows = conn.execute(
+            "SELECT DISTINCT folder FROM media_items WHERE bucket_type='source' AND folder LIKE ?",
             (prefix + "%",)
         ).fetchall()
 
         folders_set = set()
-        files = []
-
-        for r in rows:
-            key = r["key"]
-            if key == prefix:
-                continue
-
-            rel_path = key[len(prefix):]
-            if "/" in rel_path:
-                # Subfolder
-                subfolder_name = rel_path.split("/")[0]
-                folders_set.add(prefix + subfolder_name + "/")
-            else:
-                # Direct file in this folder
-                files.append({
-                    "name": r["filename"],
-                    "key": r["key"],
-                    "size": r["size"],
-                    "last_modified": r["last_modified"],
-                    "ext": r["ext"].lstrip("."),
-                    "is_video": r["file_type"] == "video",
-                    "is_image": r["file_type"] == "image",
-                    "direct_url": r["direct_url"],
-                    "stream_url": r["stream_url"]
-                })
+        for fr in folder_rows:
+            f_val = fr["folder"]
+            if f_val and f_val != prefix:
+                rel = f_val[len(prefix):]
+                if rel:
+                    immediate = rel.split("/")[0]
+                    folders_set.add(prefix + immediate + "/")
 
         folders = []
         for f_prefix in sorted(list(folders_set)):
             f_name = f_prefix[len(prefix):].rstrip("/")
+            if search and search.lower() not in f_name.lower():
+                continue
             folders.append({"name": f_name, "prefix": f_prefix})
+
+        # 2. Fetch direct files under prefix (paginated)
+        where_files = "WHERE bucket_type='source' AND folder = ?"
+        params_files = [prefix]
+        if search:
+            where_files += " AND (filename LIKE ? OR key LIKE ?)"
+            s_param = f"%{search}%"
+            params_files.extend([s_param, s_param])
+
+        count_row = conn.execute(
+            f"SELECT COUNT(*) AS c FROM media_items {where_files}",
+            params_files
+        ).fetchone()
+        total_files = count_row["c"] if count_row else 0
+
+        file_rows = conn.execute(
+            f"SELECT key, filename, folder, ext, file_type, size, last_modified, direct_url, stream_url FROM media_items {where_files} ORDER BY filename ASC LIMIT ? OFFSET ?",
+            params_files + [limit, offset]
+        ).fetchall()
+
+        files = []
+        for r in file_rows:
+            files.append({
+                "name": r["filename"],
+                "key": r["key"],
+                "size": r["size"],
+                "last_modified": r["last_modified"],
+                "ext": r["ext"].lstrip("."),
+                "is_video": r["file_type"] == "video",
+                "is_image": r["file_type"] == "image",
+                "direct_url": r["direct_url"],
+                "stream_url": r["stream_url"]
+            })
+
+        total_pages = math.ceil(total_files / limit) if total_files > 0 else 1
 
         return {
             "prefix": prefix,
             "folders": folders,
             "files": files,
+            "total_files": total_files,
+            "page": page,
+            "limit": limit,
+            "total_pages": total_pages,
             "bucket": SOURCE_R2_BUCKET
         }
     finally:
         conn.close()
 
-def list_all_images_from_db(search=""):
+def list_all_images_from_db(search="", page=1, limit=36):
     """
-    Returns ALL images across all folders from Source R2 (flat view).
+    Returns ALL images across all folders from Source R2 (flat view) paginated.
     """
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 36), 500))
+    offset = (page - 1) * limit
+    search = (search or "").strip()
+
     conn = get_connection()
     try:
-        query = "SELECT key, filename, folder, ext, size, last_modified, direct_url, stream_url FROM media_items WHERE bucket_type='source' AND file_type='image'"
+        where_clause = "WHERE bucket_type='source' AND file_type='image'"
         params = []
         if search:
-            query += " AND (filename LIKE ? OR key LIKE ?)"
+            where_clause += " AND (filename LIKE ? OR key LIKE ?)"
             s_param = f"%{search}%"
             params.extend([s_param, s_param])
-        query += " ORDER BY last_modified DESC, id DESC"
 
-        rows = conn.execute(query, params).fetchall()
+        count_row = conn.execute(
+            f"SELECT COUNT(*) AS c FROM media_items {where_clause}",
+            params
+        ).fetchone()
+        total = count_row["c"] if count_row else 0
+
+        query = f"SELECT key, filename, folder, ext, size, last_modified, direct_url, stream_url FROM media_items {where_clause} ORDER BY last_modified DESC, id DESC LIMIT ? OFFSET ?"
+        rows = conn.execute(query, params + [limit, offset]).fetchall()
+
         images = []
         for r in rows:
             images.append({
@@ -338,25 +379,45 @@ def list_all_images_from_db(search=""):
                 "direct_url": r["direct_url"],
                 "stream_url": r["stream_url"]
             })
-        return images
+
+        total_pages = math.ceil(total / limit) if total > 0 else 1
+        return {
+            "items": images,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": total_pages
+        }
     finally:
         conn.close()
 
-def list_all_videos_from_db(search=""):
+def list_all_videos_from_db(search="", page=1, limit=24):
     """
-    Returns ALL videos across all folders from Source R2 (flat view).
+    Returns ALL videos across all folders from Source R2 (flat view) paginated.
     """
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 24), 500))
+    offset = (page - 1) * limit
+    search = (search or "").strip()
+
     conn = get_connection()
     try:
-        query = "SELECT key, filename, folder, ext, size, last_modified, direct_url, stream_url FROM media_items WHERE bucket_type='source' AND file_type='video'"
+        where_clause = "WHERE bucket_type='source' AND file_type='video'"
         params = []
         if search:
-            query += " AND (filename LIKE ? OR key LIKE ?)"
+            where_clause += " AND (filename LIKE ? OR key LIKE ?)"
             s_param = f"%{search}%"
             params.extend([s_param, s_param])
-        query += " ORDER BY last_modified DESC, id DESC"
 
-        rows = conn.execute(query, params).fetchall()
+        count_row = conn.execute(
+            f"SELECT COUNT(*) AS c FROM media_items {where_clause}",
+            params
+        ).fetchone()
+        total = count_row["c"] if count_row else 0
+
+        query = f"SELECT key, filename, folder, ext, size, last_modified, direct_url, stream_url FROM media_items {where_clause} ORDER BY last_modified DESC, id DESC LIMIT ? OFFSET ?"
+        rows = conn.execute(query, params + [limit, offset]).fetchall()
+
         videos = []
         for r in rows:
             videos.append({
@@ -369,25 +430,45 @@ def list_all_videos_from_db(search=""):
                 "direct_url": r["direct_url"],
                 "stream_url": r["stream_url"]
             })
-        return videos
+
+        total_pages = math.ceil(total / limit) if total > 0 else 1
+        return {
+            "items": videos,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": total_pages
+        }
     finally:
         conn.close()
 
-def list_thumbnails_from_db(search=""):
+def list_thumbnails_from_db(search="", page=1, limit=36):
     """
-    Returns ALL thumbnails from Destination R2.
+    Returns ALL thumbnails from Destination R2 paginated.
     """
+    page = max(1, int(page or 1))
+    limit = max(1, min(int(limit or 36), 500))
+    offset = (page - 1) * limit
+    search = (search or "").strip()
+
     conn = get_connection()
     try:
-        query = "SELECT key, filename, folder, ext, size, last_modified, direct_url, stream_url FROM media_items WHERE bucket_type='dest' AND (file_type='thumbnail' OR file_type='image')"
+        where_clause = "WHERE bucket_type='dest' AND (file_type='thumbnail' OR file_type='image')"
         params = []
         if search:
-            query += " AND (filename LIKE ? OR key LIKE ?)"
+            where_clause += " AND (filename LIKE ? OR key LIKE ?)"
             s_param = f"%{search}%"
             params.extend([s_param, s_param])
-        query += " ORDER BY last_modified DESC, id DESC"
 
-        rows = conn.execute(query, params).fetchall()
+        count_row = conn.execute(
+            f"SELECT COUNT(*) AS c FROM media_items {where_clause}",
+            params
+        ).fetchone()
+        total = count_row["c"] if count_row else 0
+
+        query = f"SELECT key, filename, folder, ext, size, last_modified, direct_url, stream_url FROM media_items {where_clause} ORDER BY last_modified DESC, id DESC LIMIT ? OFFSET ?"
+        rows = conn.execute(query, params + [limit, offset]).fetchall()
+
         thumbs = []
         for r in rows:
             thumbs.append({
@@ -399,7 +480,15 @@ def list_thumbnails_from_db(search=""):
                 "direct_url": r["direct_url"],
                 "stream_url": r["stream_url"]
             })
-        return thumbs
+
+        total_pages = math.ceil(total / limit) if total > 0 else 1
+        return {
+            "items": thumbs,
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "total_pages": total_pages
+        }
     finally:
         conn.close()
 

@@ -269,8 +269,11 @@ def health():
 @app.route("/api/files")
 def api_files():
     prefix = request.args.get("prefix", "")
+    page = request.args.get("page", 1, type=int)
+    limit = request.args.get("limit", 36, type=int)
+    search = request.args.get("search", "")
     try:
-        data = list_directory_from_db(prefix)
+        data = list_directory_from_db(prefix, page=page, limit=limit, search=search)
         return jsonify({"success": True, "data": data})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -278,27 +281,55 @@ def api_files():
 @app.route("/api/images")
 def api_images():
     search = request.args.get("search", "")
+    page = request.args.get("page", 1, type=int)
+    limit = request.args.get("limit", 36, type=int)
     try:
-        images = list_all_images_from_db(search)
-        return jsonify({"success": True, "images": images, "total": len(images)})
+        res = list_all_images_from_db(search, page=page, limit=limit)
+        return jsonify({
+            "success": True, 
+            "images": res["items"], 
+            "total": res["total"],
+            "page": res["page"],
+            "limit": res["limit"],
+            "total_pages": res["total_pages"]
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/videos")
 def api_videos():
     search = request.args.get("search", "")
+    page = request.args.get("page", 1, type=int)
+    limit = request.args.get("limit", 24, type=int)
     try:
-        videos = list_all_videos_from_db(search)
-        return jsonify({"success": True, "videos": videos, "total": len(videos)})
+        res = list_all_videos_from_db(search, page=page, limit=limit)
+        return jsonify({
+            "success": True, 
+            "videos": res["items"], 
+            "total": res["total"],
+            "page": res["page"],
+            "limit": res["limit"],
+            "total_pages": res["total_pages"]
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
 @app.route("/api/thumbnails")
 def api_thumbnails():
     search = request.args.get("search", "")
+    page = request.args.get("page", 1, type=int)
+    limit = request.args.get("limit", 36, type=int)
     try:
-        data = list_thumbnails_from_db(search)
-        return jsonify({"success": True, "thumbnails": data, "bucket": DEST_R2_BUCKET})
+        res = list_thumbnails_from_db(search, page=page, limit=limit)
+        return jsonify({
+            "success": True, 
+            "thumbnails": res["items"], 
+            "total": res["total"],
+            "page": res["page"],
+            "limit": res["limit"],
+            "total_pages": res["total_pages"],
+            "bucket": DEST_R2_BUCKET
+        })
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -650,7 +681,7 @@ INDEX_HTML = """
         <div class="flex items-center gap-2">
           <!-- Select All Images Checkbox -->
           <button onclick="toggleSelectAllImages()" class="px-2.5 py-1.5 rounded-lg border border-zinc-700 bg-zinc-950 hover:bg-zinc-800 text-[11px] text-zinc-300 cursor-pointer">
-            Select All
+            Select / Deselect Page
           </button>
 
           <div class="relative min-w-[240px]">
@@ -659,7 +690,7 @@ INDEX_HTML = """
               type="text" 
               id="allImagesSearch" 
               placeholder="Search images by name..." 
-              oninput="filterAllImages()" 
+              oninput="onImagesSearchInput()" 
               class="w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-zinc-600"
             >
           </div>
@@ -670,6 +701,7 @@ INDEX_HTML = """
       <div id="allImagesGrid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
         <!-- Rendered dynamically -->
       </div>
+      <div id="imagesPaginationContainer"></div>
     </div>
 
     <!-- ============================================================ -->
@@ -680,12 +712,12 @@ INDEX_HTML = """
         <div class="flex items-center gap-2 text-xs">
           <i data-lucide="film" class="w-4 h-4 text-rose-400"></i>
           <span class="font-semibold text-white">All Source Videos</span>
-          <span class="text-zinc-500 font-mono text-[11px]">(All folders combined)</span>
+          <span class="text-zinc-500 font-mono text-[11px]" id="videosHeaderSubtext">(All folders combined)</span>
         </div>
 
         <div class="flex items-center gap-2">
           <button onclick="toggleSelectAllVideos()" class="px-2.5 py-1.5 rounded-lg border border-zinc-700 bg-zinc-950 hover:bg-zinc-800 text-[11px] text-zinc-300 cursor-pointer">
-            Select All
+            Select / Deselect Page
           </button>
 
           <div class="relative min-w-[240px]">
@@ -694,7 +726,7 @@ INDEX_HTML = """
               type="text" 
               id="allVideosSearch" 
               placeholder="Search videos by name..." 
-              oninput="filterAllVideos()" 
+              oninput="onVideosSearchInput()" 
               class="w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-zinc-600"
             >
           </div>
@@ -705,6 +737,7 @@ INDEX_HTML = """
       <div id="allVideosGrid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
         <!-- Rendered dynamically -->
       </div>
+      <div id="videosPaginationContainer"></div>
     </div>
 
     <!-- ============================================================ -->
@@ -725,7 +758,7 @@ INDEX_HTML = """
               type="text" 
               id="explorerSearch" 
               placeholder="Search current folder..." 
-              oninput="renderExplorerView()" 
+              oninput="onExplorerSearchInput()" 
               class="w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-zinc-600"
             >
           </div>
@@ -744,6 +777,7 @@ INDEX_HTML = """
       <div id="explorerContainer">
         <!-- Dynamic folders and files -->
       </div>
+      <div id="explorerPaginationContainer"></div>
 
     </div>
 
@@ -755,7 +789,7 @@ INDEX_HTML = """
         <div class="flex items-center gap-2 text-xs">
           <i data-lucide="sparkles" class="w-4 h-4 text-amber-400"></i>
           <span class="font-semibold text-white">Destination R2 Thumbnails</span>
-          <span class="text-zinc-500 font-mono text-[11px]">(new_thumbnails/ folder)</span>
+          <span class="text-zinc-500 font-mono text-[11px]" id="thumbsHeaderSubtext">(new_thumbnails/ folder)</span>
         </div>
 
         <div class="flex items-center gap-2">
@@ -765,7 +799,7 @@ INDEX_HTML = """
               type="text" 
               id="thumbsSearch" 
               placeholder="Search thumbnails..." 
-              oninput="filterThumbnails()" 
+              oninput="onThumbsSearchInput()" 
               class="w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-zinc-600"
             >
           </div>
@@ -775,6 +809,7 @@ INDEX_HTML = """
       <div id="thumbnailsGrid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
         <!-- Rendered dynamically -->
       </div>
+      <div id="thumbnailsPaginationContainer"></div>
     </div>
 
   </main>
@@ -905,6 +940,72 @@ INDEX_HTML = """
     let allVideosData = [];
     let thumbnailsData = [];
 
+    // Pagination states
+    const imagesPaging = { page: 1, limit: 36, total: 0, totalPages: 1 };
+    const videosPaging = { page: 1, limit: 24, total: 0, totalPages: 1 };
+    const thumbsPaging = { page: 1, limit: 36, total: 0, totalPages: 1 };
+    const explorerPaging = { page: 1, limit: 36, total: 0, totalPages: 1 };
+
+    function renderPaginationHTML({ targetView, page, totalPages, totalItems, limit, onPageFn, onLimitFn }) {
+      if (totalItems <= 0) return "";
+      const startItem = (page - 1) * limit + 1;
+      const endItem = Math.min(page * limit, totalItems);
+
+      return `
+        <div class="flex flex-col sm:flex-row items-center justify-between gap-3 pt-4 border-t border-zinc-800 text-xs text-zinc-400">
+          <div class="flex flex-wrap items-center gap-3 font-mono">
+            <span>Showing <strong class="text-white">${startItem}</strong> - <strong class="text-white">${endItem}</strong> of <strong class="text-white">${totalItems.toLocaleString()}</strong> items</span>
+            <span class="text-zinc-600 hidden sm:inline">|</span>
+            <label class="flex items-center gap-1.5">
+              <span>Per page:</span>
+              <select onchange="${onLimitFn}(Number(this.value))" class="bg-zinc-950 border border-zinc-800 rounded px-2 py-1 text-white text-xs focus:outline-none focus:border-zinc-700 cursor-pointer">
+                <option value="24" ${limit === 24 ? 'selected' : ''}>24</option>
+                <option value="36" ${limit === 36 ? 'selected' : ''}>36</option>
+                <option value="48" ${limit === 48 ? 'selected' : ''}>48</option>
+                <option value="96" ${limit === 96 ? 'selected' : ''}>96</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="flex items-center gap-1.5 font-mono">
+            <button 
+              onclick="${onPageFn}(1)" 
+              ${page <= 1 ? 'disabled class="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800/60 text-zinc-600 cursor-not-allowed"' : 'class="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-white hover:bg-zinc-800 cursor-pointer transition-colors"'} 
+              title="First Page"
+            >
+              &laquo; First
+            </button>
+            <button 
+              onclick="${onPageFn}(${page - 1})" 
+              ${page <= 1 ? 'disabled class="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800/60 text-zinc-600 cursor-not-allowed"' : 'class="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-white hover:bg-zinc-800 cursor-pointer transition-colors"'} 
+              title="Previous Page"
+            >
+              &lsaquo; Prev
+            </button>
+
+            <span class="px-3 py-1 rounded bg-zinc-950 border border-zinc-800 text-zinc-400">
+              Page <strong class="text-white">${page}</strong> of <strong class="text-white">${totalPages}</strong>
+            </span>
+
+            <button 
+              onclick="${onPageFn}(${page + 1})" 
+              ${page >= totalPages ? 'disabled class="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800/60 text-zinc-600 cursor-not-allowed"' : 'class="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-white hover:bg-zinc-800 cursor-pointer transition-colors"'} 
+              title="Next Page"
+            >
+              Next &rsaquo;
+            </button>
+            <button 
+              onclick="${onPageFn}(${totalPages})" 
+              ${page >= totalPages ? 'disabled class="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800/60 text-zinc-600 cursor-not-allowed"' : 'class="px-2.5 py-1 rounded bg-zinc-900 border border-zinc-800 text-zinc-300 hover:text-white hover:bg-zinc-800 cursor-pointer transition-colors"'} 
+              title="Last Page"
+            >
+              Last &raquo;
+            </button>
+          </div>
+        </div>
+      `;
+    }
+
     // Selected items (Set of keys or folder prefixes)
     let selectedFiles = new Set();
     let selectedFolders = new Set();
@@ -998,18 +1099,66 @@ INDEX_HTML = """
     }
 
     // ------------------------------------------------------------
-    // 1. ALL IMAGES (FLAT ACROSS ALL FOLDERS)
+    // 1. ALL IMAGES (FLAT ACROSS ALL FOLDERS - PAGINATED)
     // ------------------------------------------------------------
+    let imagesSearchTimeout = null;
+    function onImagesSearchInput() {
+      clearTimeout(imagesSearchTimeout);
+      imagesSearchTimeout = setTimeout(() => {
+        imagesPaging.page = 1;
+        loadAllImages();
+      }, 300);
+    }
+
+    function filterAllImages() {
+      onImagesSearchInput();
+    }
+
+    function setImagesPage(p) {
+      if (p < 1 || p > imagesPaging.totalPages || p === imagesPaging.page) return;
+      imagesPaging.page = p;
+      loadAllImages();
+      document.getElementById("viewImages")?.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function setImagesLimit(l) {
+      imagesPaging.limit = l;
+      imagesPaging.page = 1;
+      loadAllImages();
+    }
+
     async function loadAllImages() {
       const container = document.getElementById("allImagesGrid");
+      const pagingContainer = document.getElementById("imagesPaginationContainer");
+      const search = (document.getElementById("allImagesSearch")?.value || "").trim();
       container.innerHTML = `<div class="col-span-full p-12 text-center text-zinc-500 text-xs">Loading images from SQLite...</div>`;
 
       try {
-        const res = await fetch("/api/images");
+        const res = await fetch(`/api/images?page=${imagesPaging.page}&limit=${imagesPaging.limit}&search=${encodeURIComponent(search)}`);
         const json = await res.json();
         if (json.success) {
           allImagesData = json.images || [];
+          imagesPaging.total = json.total || 0;
+          imagesPaging.totalPages = json.total_pages || 1;
+          imagesPaging.page = json.page || 1;
+
+          const subtext = document.getElementById("imagesHeaderSubtext");
+          if (subtext) {
+            subtext.innerText = `(${imagesPaging.total.toLocaleString()} images • Page ${imagesPaging.page} of ${imagesPaging.totalPages})`;
+          }
+
           renderAllImagesView();
+          if (pagingContainer) {
+            pagingContainer.innerHTML = renderPaginationHTML({
+              targetView: 'images',
+              page: imagesPaging.page,
+              totalPages: imagesPaging.totalPages,
+              totalItems: imagesPaging.total,
+              limit: imagesPaging.limit,
+              onPageFn: 'setImagesPage',
+              onLimitFn: 'setImagesLimit'
+            });
+          }
         } else {
           container.innerHTML = `<div class="col-span-full p-8 text-center text-red-400 text-xs">${json.error}</div>`;
         }
@@ -1018,26 +1167,15 @@ INDEX_HTML = """
       }
     }
 
-    function filterAllImages() {
-      renderAllImagesView();
-    }
-
     function renderAllImagesView() {
       const container = document.getElementById("allImagesGrid");
-      const search = (document.getElementById("allImagesSearch")?.value || "").toLowerCase().trim();
       let filtered = allImagesData;
-      if (search) {
-        filtered = filtered.filter(img => img.name.toLowerCase().includes(search) || img.key.toLowerCase().includes(search));
-      }
-
-      const subtext = document.getElementById("imagesHeaderSubtext");
-      if (subtext) subtext.innerText = `(${filtered.length} images found across all folders)`;
 
       if (filtered.length === 0) {
         container.innerHTML = `
           <div class="col-span-full p-14 text-center text-zinc-500 text-xs bg-zinc-900 border border-zinc-800 rounded-xl space-y-2">
             <i data-lucide="image" class="w-8 h-8 mx-auto text-zinc-600"></i>
-            <div>No images found. Click 'Rescan R2' to index items from your bucket!</div>
+            <div>No images found. Try a different search or click 'Rescan R2' to index items!</div>
           </div>
         `;
         lucide.createIcons();
@@ -1118,9 +1256,9 @@ INDEX_HTML = """
     }
 
     function toggleSelectAllImages() {
-      const allSelected = allImagesData.every(img => selectedFiles.has(img.key));
+      const allSelected = allImagesData.length > 0 && allImagesData.every(img => selectedFiles.has(img.key));
       if (allSelected) {
-        selectedFiles.clear();
+        allImagesData.forEach(img => selectedFiles.delete(img.key));
       } else {
         allImagesData.forEach(img => selectedFiles.add(img.key));
       }
@@ -1129,18 +1267,66 @@ INDEX_HTML = """
     }
 
     // ------------------------------------------------------------
-    // 2. ALL VIDEOS (FLAT ACROSS ALL FOLDERS)
+    // 2. ALL VIDEOS (FLAT ACROSS ALL FOLDERS - PAGINATED)
     // ------------------------------------------------------------
+    let videosSearchTimeout = null;
+    function onVideosSearchInput() {
+      clearTimeout(videosSearchTimeout);
+      videosSearchTimeout = setTimeout(() => {
+        videosPaging.page = 1;
+        loadAllVideos();
+      }, 300);
+    }
+
+    function filterAllVideos() {
+      onVideosSearchInput();
+    }
+
+    function setVideosPage(p) {
+      if (p < 1 || p > videosPaging.totalPages || p === videosPaging.page) return;
+      videosPaging.page = p;
+      loadAllVideos();
+      document.getElementById("viewVideos")?.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function setVideosLimit(l) {
+      videosPaging.limit = l;
+      videosPaging.page = 1;
+      loadAllVideos();
+    }
+
     async function loadAllVideos() {
       const container = document.getElementById("allVideosGrid");
+      const pagingContainer = document.getElementById("videosPaginationContainer");
+      const search = (document.getElementById("allVideosSearch")?.value || "").trim();
       container.innerHTML = `<div class="col-span-full p-12 text-center text-zinc-500 text-xs">Loading videos from SQLite...</div>`;
 
       try {
-        const res = await fetch("/api/videos");
+        const res = await fetch(`/api/videos?page=${videosPaging.page}&limit=${videosPaging.limit}&search=${encodeURIComponent(search)}`);
         const json = await res.json();
         if (json.success) {
           allVideosData = json.videos || [];
+          videosPaging.total = json.total || 0;
+          videosPaging.totalPages = json.total_pages || 1;
+          videosPaging.page = json.page || 1;
+
+          const subtext = document.getElementById("videosHeaderSubtext");
+          if (subtext) {
+            subtext.innerText = `(${videosPaging.total.toLocaleString()} videos • Page ${videosPaging.page} of ${videosPaging.totalPages})`;
+          }
+
           renderAllVideosView();
+          if (pagingContainer) {
+            pagingContainer.innerHTML = renderPaginationHTML({
+              targetView: 'videos',
+              page: videosPaging.page,
+              totalPages: videosPaging.totalPages,
+              totalItems: videosPaging.total,
+              limit: videosPaging.limit,
+              onPageFn: 'setVideosPage',
+              onLimitFn: 'setVideosLimit'
+            });
+          }
         } else {
           container.innerHTML = `<div class="col-span-full p-8 text-center text-red-400 text-xs">${json.error}</div>`;
         }
@@ -1149,23 +1335,15 @@ INDEX_HTML = """
       }
     }
 
-    function filterAllVideos() {
-      renderAllVideosView();
-    }
-
     function renderAllVideosView() {
       const container = document.getElementById("allVideosGrid");
-      const search = (document.getElementById("allVideosSearch")?.value || "").toLowerCase().trim();
       let filtered = allVideosData;
-      if (search) {
-        filtered = filtered.filter(v => v.name.toLowerCase().includes(search) || v.key.toLowerCase().includes(search));
-      }
 
       if (filtered.length === 0) {
         container.innerHTML = `
           <div class="col-span-full p-14 text-center text-zinc-500 text-xs bg-zinc-900 border border-zinc-800 rounded-xl space-y-2">
             <i data-lucide="film" class="w-8 h-8 mx-auto text-zinc-600"></i>
-            <div>No videos found.</div>
+            <div>No videos found. Try a different search!</div>
           </div>
         `;
         lucide.createIcons();
@@ -1269,9 +1447,9 @@ INDEX_HTML = """
     }
 
     function toggleSelectAllVideos() {
-      const allSelected = allVideosData.every(v => selectedFiles.has(v.key));
+      const allSelected = allVideosData.length > 0 && allVideosData.every(v => selectedFiles.has(v.key));
       if (allSelected) {
-        selectedFiles.clear();
+        allVideosData.forEach(v => selectedFiles.delete(v.key));
       } else {
         allVideosData.forEach(v => selectedFiles.add(v.key));
       }
@@ -1280,23 +1458,69 @@ INDEX_HTML = """
     }
 
     // ------------------------------------------------------------
-    // 3. EXPLORER VIEW (HIERARCHY SUBFOLDERS & FILES)
+    // 3. EXPLORER VIEW (HIERARCHY SUBFOLDERS & FILES - PAGINATED)
     // ------------------------------------------------------------
+    let explorerSearchTimeout = null;
+    function onExplorerSearchInput() {
+      clearTimeout(explorerSearchTimeout);
+      explorerSearchTimeout = setTimeout(() => {
+        explorerPaging.page = 1;
+        loadExplorer(currentPrefix);
+      }, 300);
+    }
+
+    function setExplorerPage(p) {
+      if (p < 1 || p > explorerPaging.totalPages || p === explorerPaging.page) return;
+      explorerPaging.page = p;
+      loadExplorer(currentPrefix);
+      document.getElementById("viewExplorer")?.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function setExplorerLimit(l) {
+      explorerPaging.limit = l;
+      explorerPaging.page = 1;
+      loadExplorer(currentPrefix);
+    }
+
     async function loadExplorer(prefix = "") {
+      if (prefix !== currentPrefix) {
+        explorerPaging.page = 1;
+      }
       currentPrefix = prefix;
       selectedFiles.clear();
       selectedFolders.clear();
       updateSelectionUI();
 
+      const search = (document.getElementById("explorerSearch")?.value || "").trim();
+      const pagingContainer = document.getElementById("explorerPaginationContainer");
+
       try {
-        const res = await fetch(`/api/files?prefix=${encodeURIComponent(prefix)}`);
+        const res = await fetch(`/api/files?prefix=${encodeURIComponent(prefix)}&page=${explorerPaging.page}&limit=${explorerPaging.limit}&search=${encodeURIComponent(search)}`);
         const json = await res.json();
-        if (json.success) {
+        if (json.success && json.data) {
           explorerData = json.data;
+          explorerPaging.total = json.data.total_files || 0;
+          explorerPaging.totalPages = json.data.total_pages || 1;
+          explorerPaging.page = json.data.page || 1;
+
           renderBreadcrumbs();
           renderExplorerView();
+
+          if (pagingContainer) {
+            pagingContainer.innerHTML = renderPaginationHTML({
+              targetView: 'explorer',
+              page: explorerPaging.page,
+              totalPages: explorerPaging.totalPages,
+              totalItems: explorerPaging.total,
+              limit: explorerPaging.limit,
+              onPageFn: 'setExplorerPage',
+              onLimitFn: 'setExplorerLimit'
+            });
+          }
         }
-      } catch (e) {}
+      } catch (e) {
+        console.error("loadExplorer error:", e);
+      }
     }
 
     function renderBreadcrumbs() {
@@ -1595,18 +1819,66 @@ INDEX_HTML = """
     }
 
     // ------------------------------------------------------------
-    // 4. DESTINATION THUMBNAILS
+    // 4. DESTINATION THUMBNAILS (PAGINATED)
     // ------------------------------------------------------------
+    let thumbsSearchTimeout = null;
+    function onThumbsSearchInput() {
+      clearTimeout(thumbsSearchTimeout);
+      thumbsSearchTimeout = setTimeout(() => {
+        thumbsPaging.page = 1;
+        loadThumbnails();
+      }, 300);
+    }
+
+    function filterThumbnails() {
+      onThumbsSearchInput();
+    }
+
+    function setThumbsPage(p) {
+      if (p < 1 || p > thumbsPaging.totalPages || p === thumbsPaging.page) return;
+      thumbsPaging.page = p;
+      loadThumbnails();
+      document.getElementById("viewThumbnails")?.scrollIntoView({ behavior: 'smooth' });
+    }
+
+    function setThumbsLimit(l) {
+      thumbsPaging.limit = l;
+      thumbsPaging.page = 1;
+      loadThumbnails();
+    }
+
     async function loadThumbnails() {
       const container = document.getElementById("thumbnailsGrid");
+      const pagingContainer = document.getElementById("thumbnailsPaginationContainer");
+      const search = (document.getElementById("thumbsSearch")?.value || "").trim();
       container.innerHTML = `<div class="col-span-full p-12 text-center text-zinc-500 text-xs">Loading thumbnails...</div>`;
 
       try {
-        const res = await fetch("/api/thumbnails");
+        const res = await fetch(`/api/thumbnails?page=${thumbsPaging.page}&limit=${thumbsPaging.limit}&search=${encodeURIComponent(search)}`);
         const json = await res.json();
         if (json.success) {
           thumbnailsData = json.thumbnails || [];
+          thumbsPaging.total = json.total || 0;
+          thumbsPaging.totalPages = json.total_pages || 1;
+          thumbsPaging.page = json.page || 1;
+
+          const subtext = document.getElementById("thumbsHeaderSubtext");
+          if (subtext) {
+            subtext.innerText = `(${thumbsPaging.total.toLocaleString()} thumbnails • Page ${thumbsPaging.page} of ${thumbsPaging.totalPages})`;
+          }
+
           renderThumbnailsView();
+          if (pagingContainer) {
+            pagingContainer.innerHTML = renderPaginationHTML({
+              targetView: 'thumbnails',
+              page: thumbsPaging.page,
+              totalPages: thumbsPaging.totalPages,
+              totalItems: thumbsPaging.total,
+              limit: thumbsPaging.limit,
+              onPageFn: 'setThumbsPage',
+              onLimitFn: 'setThumbsLimit'
+            });
+          }
         } else {
           container.innerHTML = `<div class="col-span-full p-8 text-center text-red-400 text-xs">${json.error}</div>`;
         }
@@ -1615,17 +1887,9 @@ INDEX_HTML = """
       }
     }
 
-    function filterThumbnails() {
-      renderThumbnailsView();
-    }
-
     function renderThumbnailsView() {
       const container = document.getElementById("thumbnailsGrid");
-      const search = (document.getElementById("thumbsSearch")?.value || "").toLowerCase().trim();
       let filtered = thumbnailsData;
-      if (search) {
-        filtered = filtered.filter(t => t.name.toLowerCase().includes(search) || t.key.toLowerCase().includes(search));
-      }
 
       if (filtered.length === 0) {
         container.innerHTML = `
