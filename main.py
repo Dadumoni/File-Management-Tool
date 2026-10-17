@@ -38,6 +38,7 @@ from media.thumbnail import generate_single_composite_thumbnail
 from uploaders.anonmp4 import upload_anonmp4_with_retry
 from uploaders.abyss import upload_abyss
 from uploaders.zerostorage import upload_zerostorage
+from server.health import start_auto_ping
 
 # ============================================================
 # INITIALIZATION & LOGGING
@@ -243,7 +244,7 @@ def background_process_worker(video_keys: list):
 @app.route("/health")
 @app.route("/ping")
 def health():
-    return jsonify({"status": "ok", "service": "File-Management-Tool", "timestamp": time.time()})
+    return jsonify({"status": "ok", "service": "File-Management-Tool", "timestamp": time.time()}), 200
 
 @app.route("/api/files")
 def api_files():
@@ -854,6 +855,7 @@ def index():
 # ============================================================
 def main():
     init_services()
+    start_auto_ping()
     port = int(os.environ.get("PORT", 8080))
     log(f"🚀 Starting R2 File Manager Web Server on port {port} for Koyeb...")
     app.run(host="0.0.0.0", port=port, debug=False)
