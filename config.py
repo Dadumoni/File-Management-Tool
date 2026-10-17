@@ -12,7 +12,7 @@ SOURCE_R2_ENDPOINT = os.getenv("SOURCE_R2_ENDPOINT") or os.getenv("R2_ENDPOINT")
 SOURCE_R2_ACCESS_KEY = os.getenv("SOURCE_R2_ACCESS_KEY") or os.getenv("R2_ACCESS_KEY")
 SOURCE_R2_SECRET_KEY = os.getenv("SOURCE_R2_SECRET_KEY") or os.getenv("R2_SECRET_KEY")
 SOURCE_R2_BUCKET = os.getenv("SOURCE_R2_BUCKET") or os.getenv("R2_BUCKET")
-SOURCE_R2_WATCH_FOLDER = os.getenv("SOURCE_R2_WATCH_FOLDER") or os.getenv("R2_WATCH_FOLDER", "uploads/")
+SOURCE_R2_WATCH_FOLDER = os.getenv("SOURCE_R2_WATCH_FOLDER", "").strip()
 
 # Destination R2 (Thumbnail Upload to new_thumbnails)
 DEST_R2_ENDPOINT = os.getenv("DEST_R2_ENDPOINT") or SOURCE_R2_ENDPOINT
@@ -49,10 +49,41 @@ UPLOAD_TIMEOUT = 30 * 60   # 30 min
 WATCH_INTERVAL = 30        # seconds between polls when idle
 UPLOAD_CHUNK_SIZE = 2 * 1024 * 1024   # 2 MB for ZeroStorage
 
+# ============================================================
+# EXTENSIONS: ALL VIDEO FORMATS & IMAGES TO SKIP
+# ============================================================
 VIDEO_EXTENSIONS = {
-    ".mp4", ".mkv", ".mov", ".avi", ".webm",
-    ".flv", ".wmv", ".mpeg", ".mpg", ".m4v",
-    ".ts", ".3gp", ".ogv", ".vob",
+    # Standard MP4 & QuickTime
+    ".mp4", ".m4v", ".m4p", ".mov", ".qt",
+    # Matroska & WebM
+    ".mkv", ".webm",
+    # Windows Media & AVI
+    ".avi", ".wmv", ".asf",
+    # MPEG Family
+    ".mpg", ".mpeg", ".m2v", ".mpe", ".mp2", ".mpv", ".m1v",
+    # Transport Streams & AVCHD
+    ".ts", ".mts", ".m2ts", ".tp", ".trp",
+    # Mobile & 3GPP
+    ".3gp", ".3g2", ".3gpp", ".3gpp2",
+    # Flash Video
+    ".flv", ".f4v", ".f4p", ".f4a", ".f4b",
+    # RealMedia
+    ".rm", ".rmvb",
+    # Ogg Video
+    ".ogv", ".ogg",
+    # DVD / VCD
+    ".vob", ".ifo", ".dat",
+    # DivX & XviD
+    ".divx", ".xvid",
+    # Raw / Professional / Broadcast Video Formats
+    ".mxf", ".roq", ".nsv", ".yuv", ".dv", ".drc",
+}
+
+IMAGE_EXTENSIONS = {
+    ".jpg", ".jpeg", ".png", ".webp", ".gif",
+    ".bmp", ".tiff", ".tif", ".svg", ".avif",
+    ".ico", ".heic", ".heif", ".raw", ".cr2",
+    ".nef", ".arw", ".psd"
 }
 
 def validate_config():

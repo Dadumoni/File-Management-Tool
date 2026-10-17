@@ -153,9 +153,17 @@ def main():
         page    = context.new_page()
 
         try:
+            log("🚀 File Management Tool initialized. Starting Source R2 scan...")
+            first_run = True
+
             while True:
+                if not first_run:
+                    log(f"Rescanning Source R2 bucket...")
+                first_run = False
+
                 videos = list_videos(s3_source)
                 if not videos:
+                    log(f"No videos found in Source R2. Waiting {WATCH_INTERVAL}s before next scan...")
                     time.sleep(WATCH_INTERVAL)
                     continue
 
@@ -164,13 +172,20 @@ def main():
                 new_videos = [v for v in videos if v["key"] not in already_done]
 
                 if not new_videos:
+                    log(f"All {len(videos)} video(s) already processed. Waiting {WATCH_INTERVAL}s before next scan...")
                     time.sleep(WATCH_INTERVAL)
                     continue
 
+                log(f"Identified {len(new_videos)} video(s) ready for download and processing:")
+                for idx, v in enumerate(new_videos, start=1):
+                    log(f"  [{idx}/{len(new_videos)}] {v['key']} ({v['size'] / (1024 * 1024):.2f} MB)")
+
                 for i, video in enumerate(new_videos, start=1):
+                    log(f"\n>>> Starting download for [{i}/{len(new_videos)}]: {video['key']}")
                     ok = process_video(s3_source, s3_dest, page, video, temp_dir, processed_titles)
                     if ok:
                         already_done.add(video["key"])
+
                 main._processed_keys = already_done
                 time.sleep(WATCH_INTERVAL)
 
