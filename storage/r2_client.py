@@ -28,7 +28,7 @@ def create_r2_clients():
         aws_access_key_id=SOURCE_R2_ACCESS_KEY,
         aws_secret_access_key=SOURCE_R2_SECRET_KEY,
         region_name="auto",
-        config=Config(signature_version="s3v4", retries={"max_attempts": 5, "mode": "adaptive"}),
+        config=Config(signature_version="s3v4", retries={"max_attempts": 5, "mode": "adaptive"}, max_pool_connections=50),
     )
     dest_s3 = boto3.client(
         "s3",
@@ -36,7 +36,7 @@ def create_r2_clients():
         aws_access_key_id=DEST_R2_ACCESS_KEY,
         aws_secret_access_key=DEST_R2_SECRET_KEY,
         region_name="auto",
-        config=Config(signature_version="s3v4", retries={"max_attempts": 5, "mode": "adaptive"}),
+        config=Config(signature_version="s3v4", retries={"max_attempts": 5, "mode": "adaptive"}, max_pool_connections=50),
     )
     return source_s3, dest_s3
 

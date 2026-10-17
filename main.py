@@ -414,12 +414,11 @@ def api_task_status():
             "logs": current_task["logs"][-60:]
         })
 
-@app.route("/api/media/stream")
+@app.route("/api/media/stream", methods=["GET", "HEAD"])
 def media_stream():
     """
-    Direct / streaming endpoint with Range request support for videos and images.
-    If public URL is configured, redirects directly. Otherwise generates presigned redirect
-    or streams bytes fallback.
+    High-performance media streaming supporting RFC 7233 HTTP Range requests.
+    Enables instant video playback and smooth seeking directly from Cloudflare R2.
     """
     key = request.args.get("key", "")
     target = request.args.get("target", "source")
@@ -432,6 +431,11 @@ def media_stream():
     if not client or not bucket:
         return "Storage client not initialized", 500
 
+    public_url = SOURCE_R2_PUBLIC_URL if target == "source" else DEST_R2_PUBLIC_URL
+    if public_url:
+        clean_key = quote(key.lstrip("/"), safe="/:@")
+        return redirect(f"{public_url.rstrip('/')}/{clean_key}", code=302)
+
     ext = Path(key).suffix.lower()
     content_type = "video/mp4"
     if ext in [".jpg", ".jpeg"]:
@@ -440,6 +444,8 @@ def media_stream():
         content_type = "image/png"
     elif ext == ".webp":
         content_type = "image/webp"
+    elif ext == ".gif":
+        content_type = "image/gif"
     elif ext == ".webm":
         content_type = "video/webm"
     elif ext in [".mkv", ".ts"]:
@@ -449,26 +455,56 @@ def media_stream():
     elif ext == ".3gp":
         content_type = "video/3gpp"
 
-    try:
-        public_url = SOURCE_R2_PUBLIC_URL if target == "source" else DEST_R2_PUBLIC_URL
-        if public_url:
-            clean_key = quote(key.lstrip("/"), safe="/:@")
-            return redirect(f"{public_url.rstrip('/')}/{clean_key}", code=302)
+    range_header = request.headers.get("Range", None)
 
-        presigned_url = client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": bucket, "Key": key},
-            ExpiresIn=3600 * 24
-        )
-        return redirect(presigned_url, code=302)
+    try:
+        # Browser HEAD request: probe for range support and total file size
+        if request.method == "HEAD":
+            s3_meta = client.head_object(Bucket=bucket, Key=key)
+            resp = Response(status=200, content_type=content_type)
+            resp.headers["Accept-Ranges"] = "bytes"
+            resp.headers["Content-Length"] = str(s3_meta.get("ContentLength", 0))
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            return resp
+
+        # HTTP Range request: stream only the requested byte chunk for instant playback & seeking
+        if range_header:
+            s3_res = client.get_object(Bucket=bucket, Key=key, Range=range_header)
+            content_range = s3_res.get("ContentRange")
+            content_length = s3_res.get("ContentLength")
+
+            def generate_range():
+                for chunk in s3_res["Body"].iter_chunks(chunk_size=64 * 1024):
+                    yield chunk
+
+            resp = Response(generate_range(), status=206, content_type=content_type)
+            resp.headers["Accept-Ranges"] = "bytes"
+            if content_range:
+                resp.headers["Content-Range"] = content_range
+            if content_length:
+                resp.headers["Content-Length"] = str(content_length)
+            resp.headers["Access-Control-Allow-Origin"] = "*"
+            resp.headers["Cache-Control"] = "no-cache"
+            return resp
+
+        # Full GET request
+        s3_res = client.get_object(Bucket=bucket, Key=key)
+        content_length = s3_res.get("ContentLength", 0)
+
+        def generate_full():
+            for chunk in s3_res["Body"].iter_chunks(chunk_size=64 * 1024):
+                yield chunk
+
+        resp = Response(generate_full(), status=200, content_type=content_type)
+        resp.headers["Accept-Ranges"] = "bytes"
+        resp.headers["Content-Length"] = str(content_length)
+        resp.headers["Access-Control-Allow-Origin"] = "*"
+        resp.headers["Cache-Control"] = "public, max-age=86400"
+        return resp
+
     except Exception as e:
-        log(f"Media stream redirect warning for {key}: {e}")
-        try:
-            s3_res = client.get_object(Bucket=bucket, Key=key)
-            return Response(s3_res["Body"].read(), status=200, content_type=content_type)
-        except Exception as inner_err:
-            log(f"Media stream failed: {inner_err}")
-            return f"Streaming error: {inner_err}", 500
+        log(f"Stream error for key '{key}': {e}")
+        return f"Streaming error: {e}", 500
 
 # ============================================================
 # EMBEDDED SINGLE-PAGE WEB EXPLORER (INDEX PAGE)
@@ -2131,14 +2167,35 @@ INDEX_HTML = """
       const player = document.getElementById("mainVideoPlayer");
       const title = document.getElementById("videoModalTitle");
       const keyText = document.getElementById("videoModalKeyText");
+      const subtitle = document.getElementById("videoModalSubtitle");
 
       title.innerText = name || key;
       keyText.innerText = `R2 Key: ${key}`;
+      if (subtitle) subtitle.innerText = "Connecting stream...";
 
-      player.src = url || `/api/media/stream?target=source&key=${encodeURIComponent(key)}`;
+      // Always stream directly through the range-supported endpoint for instant playback
+      const streamUrl = `/api/media/stream?target=source&key=${encodeURIComponent(key)}`;
+      player.preload = "auto";
+      player.src = streamUrl;
+
       modal.classList.remove("hidden");
       player.load();
-      player.play().catch(e => console.log("Autoplay notice:", e));
+
+      player.oncanplay = () => {
+        if (subtitle) subtitle.innerText = "Streaming (Instant Play)";
+      };
+
+      player.onerror = () => {
+        console.error("Video player error:", player.error);
+        if (subtitle) subtitle.innerText = "Error: Video format not supported natively or stream failed";
+      };
+
+      const playPromise = player.play();
+      if (playPromise !== undefined) {
+        playPromise.catch(e => {
+          console.log("Autoplay notice:", e);
+        });
+      }
       lucide.createIcons();
     }
 
@@ -2147,7 +2204,8 @@ INDEX_HTML = """
       const player = document.getElementById("mainVideoPlayer");
       modal.classList.add("hidden");
       player.pause();
-      player.src = "";
+      player.removeAttribute("src");
+      player.load();
       currentlyPlayingKey = "";
     }
 

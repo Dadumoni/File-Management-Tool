@@ -60,26 +60,30 @@ def init_db():
             conn.execute("CREATE INDEX IF NOT EXISTS idx_media_file_type ON media_items(file_type);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_media_folder ON media_items(folder);")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_media_key ON media_items(key);")
+            # Migrate any previous rows with unauthenticated direct endpoints to stream endpoint
+            conn.execute("""
+                UPDATE media_items 
+                SET direct_url = '/api/media/stream?target=' || bucket_type || '&key=' || key 
+                WHERE direct_url LIKE '%r2.cloudflarestorage.com%'
+            """)
             conn.commit()
         finally:
             conn.close()
 
 def make_direct_url(bucket_type: str, bucket_name: str, key: str) -> str:
     """
-    Constructs a direct clean URL (NOT a signed URL).
-    Uses public custom/r2.dev URL if set, otherwise standard direct bucket endpoint.
+    Constructs a direct clean URL.
+    Uses public custom/r2.dev URL if set, otherwise stream endpoint.
     """
     clean_key = quote(key.lstrip("/"), safe="/:@")
     if bucket_type == "source":
         if SOURCE_R2_PUBLIC_URL:
             return f"{SOURCE_R2_PUBLIC_URL.rstrip('/')}/{clean_key}"
-        endpoint = (SOURCE_R2_ENDPOINT or "").rstrip("/")
-        return f"{endpoint}/{bucket_name}/{clean_key}"
+        return f"/api/media/stream?target=source&key={clean_key}"
     else:
         if DEST_R2_PUBLIC_URL:
             return f"{DEST_R2_PUBLIC_URL.rstrip('/')}/{clean_key}"
-        endpoint = (DEST_R2_ENDPOINT or "").rstrip("/")
-        return f"{endpoint}/{bucket_name}/{clean_key}"
+        return f"/api/media/stream?target=dest&key={clean_key}"
 
 def make_stream_url(bucket_type: str, key: str) -> str:
     return f"/api/media/stream?target={bucket_type}&key={quote(key)}"
