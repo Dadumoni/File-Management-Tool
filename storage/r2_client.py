@@ -7,7 +7,6 @@ from config import (
     SOURCE_R2_ACCESS_KEY,
     SOURCE_R2_SECRET_KEY,
     SOURCE_R2_BUCKET,
-    SOURCE_R2_WATCH_FOLDER,
     DEST_R2_ENDPOINT,
     DEST_R2_ACCESS_KEY,
     DEST_R2_SECRET_KEY,
@@ -40,59 +39,6 @@ def create_r2_clients():
         config=Config(signature_version="s3v4", retries={"max_attempts": 5, "mode": "adaptive"}),
     )
     return source_s3, dest_s3
-
-def list_videos(s3_source):
-    """
-    Scans the entire Source R2 bucket (or watch folder if specified).
-    Skips all image files (.jpg, .png, etc.) and thumbnail folders.
-    Identifies all video files across supported video extensions.
-    """
-    prefix = (SOURCE_R2_WATCH_FOLDER or "").strip()
-    if prefix and not prefix.endswith("/"):
-        prefix += "/"
-
-    scan_target = f"prefix '{prefix}'" if prefix else "entire bucket"
-    log(f"Scanning Source R2 bucket '{SOURCE_R2_BUCKET}' ({scan_target})...")
-
-    videos = []
-    skipped_images = 0
-    skipped_other = 0
-
-    paginator = s3_source.get_paginator("list_objects_v2")
-    paginate_args = {"Bucket": SOURCE_R2_BUCKET}
-    if prefix:
-        paginate_args["Prefix"] = prefix
-
-    for page in paginator.paginate(**paginate_args):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if key.endswith("/"):
-                continue
-
-            # Skip thumbnail directories
-            key_lower = key.lower()
-            if "new_thumbnails/" in key_lower or "thumbnails/" in key_lower:
-                continue
-
-            ext = Path(key).suffix.lower()
-
-            # Skip all image formats
-            if ext in IMAGE_EXTENSIONS:
-                skipped_images += 1
-                continue
-
-            # Check all supported video extensions
-            if ext in VIDEO_EXTENSIONS:
-                videos.append({
-                    "key": key,
-                    "size": obj["Size"],
-                    "last_modified": obj.get("LastModified"),
-                })
-            else:
-                skipped_other += 1
-
-    log(f"R2 Scan completed: Found {len(videos)} video file(s). (Skipped {skipped_images} image(s), {skipped_other} other non-video file(s)).")
-    return videos
 
 def delete_from_r2(s3_source, key):
     log(f"Deleting original video from Source R2: {key}")

@@ -7,12 +7,11 @@ load_dotenv()
 # ============================================================
 # CLOUDFLARE R2 CONFIGURATION
 # ============================================================
-# Source R2 (Video Download & Watch)
+# Source R2 (Video Source & File Explorer)
 SOURCE_R2_ENDPOINT = os.getenv("SOURCE_R2_ENDPOINT") or os.getenv("R2_ENDPOINT")
 SOURCE_R2_ACCESS_KEY = os.getenv("SOURCE_R2_ACCESS_KEY") or os.getenv("R2_ACCESS_KEY")
 SOURCE_R2_SECRET_KEY = os.getenv("SOURCE_R2_SECRET_KEY") or os.getenv("R2_SECRET_KEY")
 SOURCE_R2_BUCKET = os.getenv("SOURCE_R2_BUCKET") or os.getenv("R2_BUCKET")
-SOURCE_R2_WATCH_FOLDER = os.getenv("SOURCE_R2_WATCH_FOLDER", "").strip()
 
 # Destination R2 (Thumbnail Upload to new_thumbnails)
 DEST_R2_ENDPOINT = os.getenv("DEST_R2_ENDPOINT") or SOURCE_R2_ENDPOINT
@@ -46,7 +45,6 @@ ABYSS_UPLOAD_URL = "http://up.hydrax.net/9e805aa56a78e2abd1be605e7af7b3cb"
 # ============================================================
 MAX_RETRIES = 3
 UPLOAD_TIMEOUT = 30 * 60   # 30 min
-WATCH_INTERVAL = 30        # seconds between polls when idle
 UPLOAD_CHUNK_SIZE = 2 * 1024 * 1024   # 2 MB for ZeroStorage
 
 # ============================================================
