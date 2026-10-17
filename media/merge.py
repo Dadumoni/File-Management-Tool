@@ -51,7 +51,7 @@ def create_merged_thumbnail(frame_paths: list, output_path: Path) -> Path:
     count = len(valid_images)
     if count == 0:
         # Fallback empty canvas with minimal text or placeholder
-        canvas.save(str(output_path), format="JPEG", quality=95)
+        canvas.save(str(output_path), format="WEBP", quality=88, method=6)
         return output_path
 
     if count == 1:
@@ -142,7 +142,7 @@ def create_merged_thumbnail(frame_paths: list, output_path: Path) -> Path:
             cropped = res.crop((cl, ct, cl + panel_w, ct + panel_h))
             canvas.paste(cropped, positions[idx])
 
-    canvas.save(str(output_path), format="JPEG", quality=95)
+    canvas.save(str(output_path), format="WEBP", quality=88, method=6)
     return output_path
 
 def inspect_video_streams(video_path: Path):

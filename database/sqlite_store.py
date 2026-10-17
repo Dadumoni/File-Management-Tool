@@ -526,7 +526,7 @@ def insert_thumbnail_to_db(key: str, size: int = 0):
                 folder = ""
             elif not folder.endswith("/"):
                 folder += "/"
-            ext = Path(key).suffix.lower() or ".jpg"
+            ext = Path(key).suffix.lower() or ".webp"
             last_mod = datetime.now().strftime("%Y-%m-%d %H:%M")
             d_url = make_direct_url("dest", DEST_R2_BUCKET, key)
             s_url = make_stream_url("dest", key)

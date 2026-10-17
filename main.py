@@ -155,7 +155,9 @@ def process_single_video(page, key: str, temp_dir: Path, processed_titles: set):
         # Step 4: Upload thumbnail to Destination R2 inside 'new_thumbnails' folder
         with task_lock:
             current_task["current_stage"] = "Uploading thumbnail to Destination R2..."
+        thumb_size = thumb_file.stat().st_size if thumb_file.exists() else 0
         thumb_path_rel = upload_thumb_to_r2(s3_dest, thumb_file, slug)
+        insert_thumbnail_to_db(thumb_path_rel, thumb_size)
         if thumb_file.exists():
             thumb_file.unlink()
 
@@ -331,7 +333,7 @@ def merge_process_worker(title: str, video_keys: list, thumb_keys: list):
                 else:
                     log(f"[Thumbnail] Warning: Frame extraction failed for {Path(t_key).name}")
 
-        thumb_file = temp_dir / "composite_thumb.jpg"
+        thumb_file = temp_dir / "composite_thumb.webp"
         create_merged_thumbnail(frame_paths, thumb_file)
 
         # Step 3: Concatenate/Merge videos in sequential order via FFmpeg

@@ -34,7 +34,7 @@ def generate_single_composite_thumbnail(video_path: Path, slug: str, temp_dir: P
 
     log(f"Video resolution: {w}x{h} | Aspect Ratio: {ratio:.3f} | Duration: {duration:.2f}s")
 
-    final_thumb_path = temp_dir / f"{slug}_thumb.jpg"
+    final_thumb_path = temp_dir / f"{slug}_thumb.webp"
 
     is_9_16 = 0.50 <= ratio <= 0.65
     is_16_9 = 1.60 <= ratio <= 1.95
@@ -72,7 +72,7 @@ def generate_single_composite_thumbnail(video_path: Path, slug: str, temp_dir: P
             y = gap
             canvas.paste(resized, (x, y))
 
-        canvas.save(str(final_thumb_path), format="JPEG", quality=95)
+        canvas.save(str(final_thumb_path), format="WEBP", quality=88, method=6)
 
         for idx in range(len(frame_times)):
             p = temp_dir / f"{slug}_part_{idx}.jpg"
@@ -114,7 +114,7 @@ def generate_single_composite_thumbnail(video_path: Path, slug: str, temp_dir: P
             resized = img.resize((cell_w, cell_h), Image.Resampling.LANCZOS)
             canvas.paste(resized, positions[i])
 
-        canvas.save(str(final_thumb_path), format="JPEG", quality=95)
+        canvas.save(str(final_thumb_path), format="WEBP", quality=88, method=6)
 
         for idx in range(len(frame_times)):
             p = temp_dir / f"{slug}_part_{idx}.jpg"
@@ -149,7 +149,7 @@ def generate_single_composite_thumbnail(video_path: Path, slug: str, temp_dir: P
                 resized = img.resize((panel_w, panel_h), Image.Resampling.LANCZOS)
                 canvas.paste(resized, (gap + i * (panel_w + gap), gap))
 
-            canvas.save(str(final_thumb_path), format="JPEG", quality=95)
+            canvas.save(str(final_thumb_path), format="WEBP", quality=88, method=6)
         else:
             part_duration = duration / 4.0
             frame_times = [0.0, part_duration, 2.0 * part_duration, 3.0 * part_duration]
@@ -182,7 +182,7 @@ def generate_single_composite_thumbnail(video_path: Path, slug: str, temp_dir: P
                 resized = img.resize((cell_w, cell_h), Image.Resampling.LANCZOS)
                 canvas.paste(resized, positions[i])
 
-            canvas.save(str(final_thumb_path), format="JPEG", quality=95)
+            canvas.save(str(final_thumb_path), format="WEBP", quality=88, method=6)
 
         for idx in range(len(frame_times)):
             p = temp_dir / f"{slug}_part_{idx}.jpg"
@@ -190,7 +190,15 @@ def generate_single_composite_thumbnail(video_path: Path, slug: str, temp_dir: P
                 p.unlink()
 
     if not final_thumb_path.exists():
-        extract_frame(video_path, 0.0, final_thumb_path)
+        fallback_jpg = temp_dir / f"{slug}_fallback_raw.jpg"
+        extract_frame(video_path, 0.0, fallback_jpg)
+        if fallback_jpg.exists():
+            try:
+                with Image.open(fallback_jpg) as img:
+                    img.convert("RGB").save(str(final_thumb_path), format="WEBP", quality=88, method=6)
+            finally:
+                if fallback_jpg.exists():
+                    fallback_jpg.unlink()
 
     log(f"Single composite thumbnail generated: {final_thumb_path.name}")
     return final_thumb_path

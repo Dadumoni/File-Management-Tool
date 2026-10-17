@@ -59,15 +59,25 @@ def upload_thumb_to_r2(s3_dest, thumb_path: Path, slug: str) -> str:
     """
     Uploads thumbnail to Destination R2 inside 'new_thumbnails' folder.
     Returns the relative thumbnail path (NOT the URL link).
-    e.g. new_thumbnails/JSBF7EB48B_thumb.jpg
+    e.g. new_thumbnails/JSBF7EB48B_thumb.webp
     """
-    r2_key = f"new_thumbnails/{slug}_thumb.jpg"
-    log(f"Uploading thumbnail to Destination R2: {r2_key}")
+    ext = thumb_path.suffix.lower() if thumb_path.suffix else ".webp"
+    if ext == ".webp":
+        content_type = "image/webp"
+    elif ext == ".avif":
+        content_type = "image/avif"
+    elif ext == ".png":
+        content_type = "image/png"
+    else:
+        content_type = "image/jpeg"
+
+    r2_key = f"new_thumbnails/{slug}_thumb{ext}"
+    log(f"Uploading thumbnail to Destination R2: {r2_key} (ContentType: {content_type})")
     s3_dest.upload_file(
         str(thumb_path),
         DEST_R2_BUCKET,
         r2_key,
-        ExtraArgs={"ContentType": "image/jpeg"},
+        ExtraArgs={"ContentType": content_type},
     )
     log(f"Thumbnail uploaded successfully to path: {r2_key}")
     return r2_key
