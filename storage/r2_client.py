@@ -186,3 +186,86 @@ def delete_targets_from_r2(s3_source, keys=None, folders=None):
 
     log(f"Successfully deleted {deleted_count} object(s) from Source R2.")
     return deleted_count
+
+def list_destination_thumbnails(s3_dest, prefix="new_thumbnails/"):
+    """
+    Lists all thumbnail images from Destination R2 bucket under the given prefix.
+    """
+    if not s3_dest:
+        return []
+    prefix = (prefix or "").strip()
+    thumbnails = []
+    paginator = s3_dest.get_paginator("list_objects_v2")
+    try:
+        for page in paginator.paginate(Bucket=DEST_R2_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if key.endswith("/"):
+                    continue
+                ext = Path(key).suffix.lower()
+                if ext in IMAGE_EXTENSIONS:
+                    thumbnails.append({
+                        "key": key,
+                        "name": Path(key).name,
+                        "size": obj["Size"],
+                        "last_modified": obj["LastModified"].strftime("%Y-%m-%d %H:%M") if obj.get("LastModified") else "",
+                    })
+    except Exception as e:
+        log(f"Warning listing destination thumbnails: {e}")
+    return sorted(thumbnails, key=lambda x: x["last_modified"], reverse=True)
+
+def delete_from_dest_r2(s3_dest, key):
+    """
+    Deletes a thumbnail from Destination R2.
+    """
+    log(f"Deleting thumbnail from Destination R2: {key}")
+    s3_dest.delete_object(Bucket=DEST_R2_BUCKET, Key=key)
+
+_counts_cache = {"timestamp": 0, "data": None}
+
+def get_bucket_counts(s3_source, s3_dest):
+    """
+    Returns quick counts of videos and images in Source R2, and thumbnails in Destination R2.
+    Uses 60s cache to keep UI responsive.
+    """
+    import time
+    now = time.time()
+    if _counts_cache["data"] and (now - _counts_cache["timestamp"] < 60):
+        return _counts_cache["data"]
+
+    videos_count = 0
+    images_count = 0
+    thumbs_count = 0
+    try:
+        if s3_source:
+            paginator = s3_source.get_paginator("list_objects_v2")
+            for page in paginator.paginate(Bucket=SOURCE_R2_BUCKET):
+                for obj in page.get("Contents", []):
+                    k = obj["Key"]
+                    if k.endswith("/"):
+                        continue
+                    ext = Path(k).suffix.lower()
+                    if ext in VIDEO_EXTENSIONS:
+                        videos_count += 1
+                    elif ext in IMAGE_EXTENSIONS:
+                        images_count += 1
+        if s3_dest:
+            paginator_dest = s3_dest.get_paginator("list_objects_v2")
+            for page in paginator_dest.paginate(Bucket=DEST_R2_BUCKET, Prefix="new_thumbnails/"):
+                for obj in page.get("Contents", []):
+                    if not obj["Key"].endswith("/"):
+                        thumbs_count += 1
+    except Exception as e:
+        log(f"Warning counting bucket objects: {e}")
+
+    result = {
+        "videos": videos_count,
+        "images": images_count,
+        "thumbnails": thumbs_count,
+        "source_bucket": SOURCE_R2_BUCKET,
+        "dest_bucket": DEST_R2_BUCKET
+    }
+    _counts_cache["timestamp"] = now
+    _counts_cache["data"] = result
+    return result
+
