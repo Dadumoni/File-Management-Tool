@@ -110,6 +110,16 @@ def list_directory(s3_source, prefix=""):
             is_video = ext in VIDEO_EXTENSIONS
             is_image = ext in IMAGE_EXTENSIONS
 
+            url = ""
+            try:
+                url = s3_source.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": SOURCE_R2_BUCKET, "Key": key},
+                    ExpiresIn=3600 * 24
+                )
+            except Exception:
+                url = ""
+
             files.append({
                 "name": file_name,
                 "key": key,
@@ -118,6 +128,7 @@ def list_directory(s3_source, prefix=""):
                 "ext": ext.lstrip("."),
                 "is_video": is_video,
                 "is_image": is_image,
+                "url": url,
             })
 
     return {
@@ -190,6 +201,7 @@ def delete_targets_from_r2(s3_source, keys=None, folders=None):
 def list_destination_thumbnails(s3_dest, prefix="new_thumbnails/"):
     """
     Lists all thumbnail images from Destination R2 bucket under the given prefix.
+    Includes direct presigned URLs for instant edge rendering.
     """
     if not s3_dest:
         return []
@@ -204,11 +216,22 @@ def list_destination_thumbnails(s3_dest, prefix="new_thumbnails/"):
                     continue
                 ext = Path(key).suffix.lower()
                 if ext in IMAGE_EXTENSIONS:
+                    url = ""
+                    try:
+                        url = s3_dest.generate_presigned_url(
+                            "get_object",
+                            Params={"Bucket": DEST_R2_BUCKET, "Key": key},
+                            ExpiresIn=3600 * 24
+                        )
+                    except Exception:
+                        url = ""
+
                     thumbnails.append({
                         "key": key,
                         "name": Path(key).name,
                         "size": obj["Size"],
                         "last_modified": obj["LastModified"].strftime("%Y-%m-%d %H:%M") if obj.get("LastModified") else "",
+                        "url": url,
                     })
     except Exception as e:
         log(f"Warning listing destination thumbnails: {e}")
@@ -225,42 +248,24 @@ _counts_cache = {"timestamp": 0, "data": None}
 
 def get_bucket_counts(s3_source, s3_dest):
     """
-    Returns quick counts of videos and images in Source R2, and thumbnails in Destination R2.
-    Uses 60s cache to keep UI responsive.
+    Returns counts without blocking. Thumbnails are counted from new_thumbnails/.
     """
     import time
     now = time.time()
-    if _counts_cache["data"] and (now - _counts_cache["timestamp"] < 60):
+    if _counts_cache["data"] and (now - _counts_cache["timestamp"] < 30):
         return _counts_cache["data"]
 
-    videos_count = 0
-    images_count = 0
     thumbs_count = 0
     try:
-        if s3_source:
-            paginator = s3_source.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=SOURCE_R2_BUCKET):
-                for obj in page.get("Contents", []):
-                    k = obj["Key"]
-                    if k.endswith("/"):
-                        continue
-                    ext = Path(k).suffix.lower()
-                    if ext in VIDEO_EXTENSIONS:
-                        videos_count += 1
-                    elif ext in IMAGE_EXTENSIONS:
-                        images_count += 1
         if s3_dest:
-            paginator_dest = s3_dest.get_paginator("list_objects_v2")
-            for page in paginator_dest.paginate(Bucket=DEST_R2_BUCKET, Prefix="new_thumbnails/"):
-                for obj in page.get("Contents", []):
-                    if not obj["Key"].endswith("/"):
-                        thumbs_count += 1
+            res = s3_dest.list_objects_v2(Bucket=DEST_R2_BUCKET, Prefix="new_thumbnails/", MaxKeys=1000)
+            for obj in res.get("Contents", []):
+                if not obj["Key"].endswith("/"):
+                    thumbs_count += 1
     except Exception as e:
-        log(f"Warning counting bucket objects: {e}")
+        log(f"Warning counting thumbnails: {e}")
 
     result = {
-        "videos": videos_count,
-        "images": images_count,
         "thumbnails": thumbs_count,
         "source_bucket": SOURCE_R2_BUCKET,
         "dest_bucket": DEST_R2_BUCKET
@@ -268,4 +273,5 @@ def get_bucket_counts(s3_source, s3_dest):
     _counts_cache["timestamp"] = now
     _counts_cache["data"] = result
     return result
+
 

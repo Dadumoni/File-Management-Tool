@@ -4,7 +4,7 @@ import tempfile
 import threading
 from pathlib import Path
 from datetime import datetime
-from flask import Flask, jsonify, request, render_template_string, Response
+from flask import Flask, jsonify, request, render_template_string, Response, redirect
 from playwright.sync_api import sync_playwright
 
 from config import (
@@ -344,38 +344,21 @@ def media_stream():
     elif ext == ".3gp":
         content_type = "video/3gpp"
 
-    range_header = request.headers.get("Range", None)
     try:
-        if range_header:
-            s3_res = client.get_object(Bucket=bucket, Key=key, Range=range_header)
-            content_range = s3_res.get("ContentRange", "")
-            content_length = s3_res.get("ContentLength", 0)
-
-            def generate_range():
-                for chunk in s3_res["Body"].iter_chunks(chunk_size=128 * 1024):
-                    yield chunk
-
-            resp = Response(generate_range(), status=206, content_type=content_type)
-            resp.headers["Content-Range"] = content_range
-            resp.headers["Accept-Ranges"] = "bytes"
-            resp.headers["Content-Length"] = content_length
-            resp.headers["Cache-Control"] = "public, max-age=86400"
-            return resp
-        else:
-            s3_res = client.get_object(Bucket=bucket, Key=key)
-            content_length = s3_res.get("ContentLength", 0)
-
-            def generate_full():
-                for chunk in s3_res["Body"].iter_chunks(chunk_size=128 * 1024):
-                    yield chunk
-
-            resp = Response(generate_full(), status=200, content_type=content_type)
-            resp.headers["Accept-Ranges"] = "bytes"
-            resp.headers["Content-Length"] = content_length
-            resp.headers["Cache-Control"] = "public, max-age=86400"
-            return resp
+        presigned_url = client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=3600 * 24
+        )
+        return redirect(presigned_url, code=302)
     except Exception as e:
-        return f"Streaming error: {e}", 500
+        log(f"Presigned error for {key}, attempting direct stream: {e}")
+        try:
+            s3_res = client.get_object(Bucket=bucket, Key=key)
+            return Response(s3_res["Body"].read(), status=200, content_type=content_type)
+        except Exception as inner_err:
+            log(f"Media stream failed: {inner_err}")
+            return f"Streaming error: {inner_err}", 500
 
 @app.route("/api/thumbnails")
 def api_thumbnails():
@@ -1003,6 +986,15 @@ INDEX_HTML = """
       let folders = directoryData.folders || [];
       let files = directoryData.files || [];
 
+      // Update top counter cards immediately from directory files
+      const allFiles = directoryData.files || [];
+      const currentVideos = allFiles.filter(f => f.is_video).length;
+      const currentImages = allFiles.filter(f => f.is_image).length;
+      const statVid = document.getElementById("statVideosCount");
+      const statImg = document.getElementById("statImagesCount");
+      if (statVid) statVid.innerText = currentVideos;
+      if (statImg) statImg.innerText = currentImages;
+
       // Apply search filter
       if (search) {
         folders = folders.filter(f => f.name.toLowerCase().includes(search));
@@ -1076,8 +1068,10 @@ INDEX_HTML = """
       files.forEach(file => {
         const isSelected = selectedFiles.has(file.key);
         const streamUrl = `/api/media/stream?target=source&key=${encodeURIComponent(file.key)}`;
+        const directUrl = file.url || streamUrl;
         const safeName = file.name.replace(/'/g, "\\\\'");
         const safeKey = file.key.replace(/'/g, "\\\\'");
+        const safeUrl = directUrl.replace(/'/g, "\\\\'");
 
         html += `
           <div class="bg-zinc-900 border ${isSelected ? 'border-blue-500 bg-blue-950/20' : 'border-zinc-800'} rounded-xl overflow-hidden flex flex-col justify-between hover:border-zinc-700 transition-all shadow-xs group">
@@ -1086,18 +1080,20 @@ INDEX_HTML = """
             <div class="relative w-full aspect-video bg-black overflow-hidden border-b border-zinc-800/80">
               
               ${file.is_video ? `
-                <!-- Video First Frame using #t=0.5 and preload=metadata -->
+                <!-- Video First Frame using direct presigned URL with onloadedmetadata -->
                 <video 
-                  src="${streamUrl}#t=0.5" 
+                  src="${directUrl}#t=0.5" 
                   preload="metadata" 
                   muted 
                   playsinline 
+                  onloadedmetadata="try{if(this.currentTime===0)this.currentTime=0.5;}catch(e){}"
+                  onerror="if(!this.dataset.retry){this.dataset.retry='1';this.src='${streamUrl}#t=0.5';}"
                   class="w-full h-full object-cover"
                 ></video>
 
                 <!-- Hover Play Overlay Icon -->
                 <div 
-                  onclick="openVideoPlayer('${safeKey}', '${safeName}')" 
+                  onclick="openVideoPlayer('${safeKey}', '${safeName}', '${safeUrl}')" 
                   class="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity cursor-pointer"
                   title="Play video"
                 >
@@ -1111,12 +1107,13 @@ INDEX_HTML = """
                   ${file.ext.toUpperCase()}
                 </span>
               ` : file.is_image ? `
-                <!-- Image Preview -->
+                <!-- Image Preview with direct presigned URL and fallback -->
                 <img 
-                  src="${streamUrl}" 
+                  src="${directUrl}" 
                   loading="lazy" 
                   alt="${file.name}" 
-                  onclick="openImageModal('${safeKey}', '${safeName}')"
+                  onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${safeUrl}')"
+                  onerror="if(!this.dataset.retry){this.dataset.retry='1';this.src='${streamUrl}';}"
                   class="w-full h-full object-cover cursor-pointer hover:scale-105 transition-transform"
                 >
                 <span class="absolute top-2 right-2 text-[9.5px] font-mono font-semibold px-1.5 py-0.5 rounded bg-blue-950/90 text-blue-300 border border-blue-800/60 shadow">
@@ -1155,7 +1152,7 @@ INDEX_HTML = """
             <div class="px-3 pb-3 pt-1 border-t border-zinc-800/80 flex items-center justify-between gap-1.5">
               ${file.is_video ? `
                 <button 
-                  onclick="openVideoPlayer('${safeKey}', '${safeName}')" 
+                  onclick="openVideoPlayer('${safeKey}', '${safeName}', '${safeUrl}')" 
                   class="flex-1 py-1 px-2 rounded-lg bg-blue-950/60 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-800/60 text-[11px] font-semibold flex items-center justify-center gap-1 transition-all cursor-pointer"
                   title="Play Video"
                 >
@@ -1173,7 +1170,7 @@ INDEX_HTML = """
                 </button>
               ` : file.is_image ? `
                 <button 
-                  onclick="openImageModal('${safeKey}', '${safeName}')" 
+                  onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${safeUrl}')" 
                   class="flex-1 py-1 px-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white text-[11px] font-medium flex items-center justify-center gap-1 transition-all cursor-pointer"
                 >
                   <i data-lucide="maximize-2" class="w-3 h-3"></i>
@@ -1251,8 +1248,10 @@ INDEX_HTML = """
       files.forEach(file => {
         const isSelected = selectedFiles.has(file.key);
         const streamUrl = `/api/media/stream?target=source&key=${encodeURIComponent(file.key)}`;
+        const directUrl = file.url || streamUrl;
         const safeName = file.name.replace(/'/g, "\\\\'");
         const safeKey = file.key.replace(/'/g, "\\\\'");
+        const safeUrl = directUrl.replace(/'/g, "\\\\'");
 
         html += `
           <div class="px-4 py-2 flex items-center justify-between hover:bg-zinc-800/40 transition-colors ${isSelected ? 'bg-blue-950/20' : ''}">
@@ -1262,12 +1261,26 @@ INDEX_HTML = """
               <!-- First Frame Preview Thumbnail in Table -->
               <div class="w-12 h-8 rounded bg-black border border-zinc-800 overflow-hidden relative shrink-0">
                 ${file.is_video ? `
-                  <video src="${streamUrl}#t=0.5" preload="metadata" muted playsinline class="w-full h-full object-cover"></video>
-                  <div onclick="openVideoPlayer('${safeKey}', '${safeName}')" class="absolute inset-0 bg-black/30 hover:bg-black/0 flex items-center justify-center cursor-pointer">
+                  <video 
+                    src="${directUrl}#t=0.5" 
+                    preload="metadata" 
+                    muted 
+                    playsinline 
+                    onloadedmetadata="try{if(this.currentTime===0)this.currentTime=0.5;}catch(e){}"
+                    onerror="if(!this.dataset.retry){this.dataset.retry='1';this.src='${streamUrl}#t=0.5';}"
+                    class="w-full h-full object-cover"
+                  ></video>
+                  <div onclick="openVideoPlayer('${safeKey}', '${safeName}', '${safeUrl}')" class="absolute inset-0 bg-black/30 hover:bg-black/0 flex items-center justify-center cursor-pointer">
                     <i data-lucide="play" class="w-2.5 h-2.5 fill-white text-white"></i>
                   </div>
                 ` : file.is_image ? `
-                  <img src="${streamUrl}" loading="lazy" onclick="openImageModal('${safeKey}', '${safeName}')" class="w-full h-full object-cover cursor-pointer">
+                  <img 
+                    src="${directUrl}" 
+                    loading="lazy" 
+                    onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${safeUrl}')" 
+                    onerror="if(!this.dataset.retry){this.dataset.retry='1';this.src='${streamUrl}';}"
+                    class="w-full h-full object-cover cursor-pointer"
+                  >
                 ` : `
                   <div class="w-full h-full flex items-center justify-center text-zinc-500"><i data-lucide="file" class="w-3.5 h-3.5"></i></div>
                 `}
@@ -1287,7 +1300,7 @@ INDEX_HTML = """
               <div class="w-36 text-right flex items-center justify-end gap-1.5">
                 ${file.is_video ? `
                   <button 
-                    onclick="openVideoPlayer('${safeKey}', '${safeName}')" 
+                    onclick="openVideoPlayer('${safeKey}', '${safeName}', '${safeUrl}')" 
                     class="px-2 py-1 rounded bg-blue-950/60 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-800/60 text-[11px] font-semibold flex items-center gap-1 transition-all cursor-pointer"
                     title="Play Video"
                   >
@@ -1304,7 +1317,7 @@ INDEX_HTML = """
                   </button>
                 ` : file.is_image ? `
                   <button 
-                    onclick="openImageModal('${safeKey}', '${safeName}')" 
+                    onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${safeUrl}')" 
                     class="px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-[11px] transition-colors cursor-pointer"
                   >
                     View
@@ -1374,8 +1387,10 @@ INDEX_HTML = """
       let html = "";
       filtered.forEach(thumb => {
         const streamUrl = `/api/media/stream?target=dest&key=${encodeURIComponent(thumb.key)}`;
+        const directUrl = thumb.url || streamUrl;
         const safeKey = thumb.key.replace(/'/g, "\\\\'");
         const safeName = thumb.name.replace(/'/g, "\\\\'");
+        const safeUrl = directUrl.replace(/'/g, "\\\\'");
 
         html += `
           <div class="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden flex flex-col justify-between hover:border-amber-500/50 transition-all shadow-xs group">
@@ -1383,10 +1398,11 @@ INDEX_HTML = """
             <!-- Thumbnail Image Container -->
             <div class="relative w-full aspect-video bg-black overflow-hidden border-b border-zinc-800/80">
               <img 
-                src="${streamUrl}" 
+                src="${directUrl}" 
                 loading="lazy" 
                 alt="${thumb.name}" 
-                onclick="openImageModal('${safeKey}', '${safeName}', 'dest')"
+                onclick="openImageModal('${safeKey}', '${safeName}', 'dest', '${safeUrl}')"
+                onerror="if(!this.dataset.retry){this.dataset.retry='1';this.src='${streamUrl}';}"
                 class="w-full h-full object-cover cursor-pointer group-hover:scale-104 transition-transform"
               >
               <span class="absolute top-2 right-2 text-[9.5px] font-mono px-1.5 py-0.5 rounded bg-black/80 text-amber-300 border border-amber-800/60 backdrop-blur">
@@ -1408,7 +1424,7 @@ INDEX_HTML = """
             <!-- Actions -->
             <div class="px-3 pb-3 pt-1 border-t border-zinc-800/80 flex items-center justify-between gap-1.5">
               <button 
-                onclick="openImageModal('${safeKey}', '${safeName}', 'dest')" 
+                onclick="openImageModal('${safeKey}', '${safeName}', 'dest', '${safeUrl}')" 
                 class="flex-1 py-1 px-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white text-[11px] font-medium flex items-center justify-center gap-1 transition-all cursor-pointer"
               >
                 <i data-lucide="maximize-2" class="w-3 h-3"></i>
@@ -1482,7 +1498,7 @@ INDEX_HTML = """
     // ------------------------------------------------------------
     // 4. VIDEO PLAYER MODAL (PLAY ACTION)
     // ------------------------------------------------------------
-    function openVideoPlayer(key, name) {
+    function openVideoPlayer(key, name, url = "") {
       currentlyPlayingKey = key;
       const modal = document.getElementById("videoModal");
       const player = document.getElementById("mainVideoPlayer");
@@ -1492,8 +1508,9 @@ INDEX_HTML = """
       title.innerText = name || key;
       keyText.innerText = `R2 Key: ${key}`;
 
-      player.src = `/api/media/stream?target=source&key=${encodeURIComponent(key)}`;
+      player.src = url || `/api/media/stream?target=source&key=${encodeURIComponent(key)}`;
       modal.classList.remove("hidden");
+      player.load();
       player.play().catch(e => console.log("Autoplay notice:", e));
       lucide.createIcons();
     }
@@ -1517,13 +1534,13 @@ INDEX_HTML = """
     // ------------------------------------------------------------
     // 5. IMAGE LIGHTBOX MODAL
     // ------------------------------------------------------------
-    function openImageModal(key, name, target = "source") {
+    function openImageModal(key, name, target = "source", url = "") {
       const modal = document.getElementById("imageModal");
       const img = document.getElementById("imageModalEl");
       const title = document.getElementById("imageModalTitle");
 
       title.innerText = name || key;
-      img.src = `/api/media/stream?target=${target}&key=${encodeURIComponent(key)}`;
+      img.src = url || `/api/media/stream?target=${target}&key=${encodeURIComponent(key)}`;
       modal.classList.remove("hidden");
       lucide.createIcons();
     }
