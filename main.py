@@ -1,5 +1,6 @@
 import os
 import time
+import shutil
 import tempfile
 import threading
 from pathlib import Path
@@ -36,6 +37,7 @@ from database.sqlite_store import (
     list_all_videos_from_db,
     list_thumbnails_from_db,
     delete_from_db,
+    insert_thumbnail_to_db,
     sync_state
 )
 from database.supabase_client import (
@@ -51,6 +53,11 @@ from database.mongo_client import (
 )
 from media.metadata import get_video_metadata
 from media.thumbnail import generate_single_composite_thumbnail
+from media.merge import (
+    extract_video_frame,
+    create_merged_thumbnail,
+    merge_videos_in_sequence
+)
 from uploaders.anonmp4 import upload_anonmp4_with_retry
 from uploaders.abyss import upload_abyss
 from uploaders.zerostorage import upload_zerostorage
@@ -258,6 +265,191 @@ def background_process_worker(video_keys: list):
             current_task["current_stage"] = "All Selected Tasks Completed"
             current_task["logs"].append("Processing finished.")
 
+def merge_process_worker(title: str, video_keys: list, thumb_keys: list):
+    """
+    Downloads videos in exact sequential order, extracts thumbnail frames from
+    user-chosen videos, merges videos with FFmpeg, uploads thumbnail to Destination R2,
+    uploads merged video to video hosts, registers in Supabase/MongoDB, and deletes
+    the source videos from Source R2.
+    """
+    # Deduplicate video keys while preserving selection order
+    seen = set()
+    unique_video_keys = [k for k in video_keys if not (k in seen or seen.add(k))]
+
+    # Deduplicate and validate thumbnail source keys
+    seen_thumb = set()
+    valid_thumb_keys = [k for k in thumb_keys if k in seen and not (k in seen_thumb or seen_thumb.add(k))]
+    if not valid_thumb_keys:
+        valid_thumb_keys = unique_video_keys[:4]
+
+    temp_dir = Path(tempfile.mkdtemp(prefix="r2_merge_"))
+
+    with task_lock:
+        current_task["is_running"] = True
+        current_task["total"] = len(unique_video_keys) + 4
+        current_task["current_index"] = 0
+        current_task["completed"] = []
+        current_task["failed"] = []
+        current_task["logs"].append(f"Starting Video Merge workflow for {len(unique_video_keys)} videos in sequence...")
+
+    try:
+        log("")
+        log("=" * 65)
+        log("STARTING VIDEO MERGE PIPELINE")
+        log(f"TITLE              : {title or '(Auto-generated)'}")
+        log(f"VIDEOS TO MERGE ({len(unique_video_keys)}):")
+        for i, vk in enumerate(unique_video_keys, 1):
+            log(f"  [{i}] {vk}")
+        log(f"THUMBNAIL SOURCES ({len(valid_thumb_keys)}):")
+        for i, tk in enumerate(valid_thumb_keys, 1):
+            log(f"  * {tk}")
+        log("=" * 65)
+
+        # Step 1: Download each video in exact order
+        downloaded = []
+        for idx, key in enumerate(unique_video_keys, start=1):
+            with task_lock:
+                current_task["current_index"] = idx
+                current_task["current_key"] = Path(key).name
+                current_task["current_stage"] = f"Downloading video {idx}/{len(unique_video_keys)}: {Path(key).name}..."
+            local_path = temp_dir / f"seq_{idx:03d}_{Path(key).name}"
+            download_from_r2(s3_source, key, local_path)
+            downloaded.append((key, local_path))
+
+        key_to_local = {k: lp for k, lp in downloaded}
+
+        # Step 2: Extract thumbnail frames from user-selected videos
+        with task_lock:
+            current_task["current_stage"] = f"Extracting thumbnail frames from {len(valid_thumb_keys)} video(s)..."
+        frame_paths = []
+        for f_idx, t_key in enumerate(valid_thumb_keys, start=1):
+            if t_key in key_to_local:
+                f_path = temp_dir / f"frame_{f_idx:03d}.jpg"
+                log(f"[Thumbnail] Extracting frame from: {Path(t_key).name}")
+                if extract_video_frame(key_to_local[t_key], f_path, timestamp=0.5):
+                    frame_paths.append(f_path)
+                else:
+                    log(f"[Thumbnail] Warning: Frame extraction failed for {Path(t_key).name}")
+
+        thumb_file = temp_dir / "composite_thumb.jpg"
+        create_merged_thumbnail(frame_paths, thumb_file)
+
+        # Step 3: Concatenate/Merge videos in sequential order via FFmpeg
+        with task_lock:
+            current_task["current_stage"] = f"Merging {len(downloaded)} video(s) in sequence with FFmpeg..."
+        merged_file = temp_dir / f"merged_{int(time.time())}.mp4"
+        input_paths = [lp for _, lp in downloaded]
+
+        ok = merge_videos_in_sequence(input_paths, merged_file, log_cb=log)
+        if not ok or not merged_file.exists() or merged_file.stat().st_size == 0:
+            raise RuntimeError("FFmpeg sequence merge failed or generated an empty output file.")
+
+        log(f"✔ Sequential merge completed! Size: {merged_file.stat().st_size / 1024 / 1024:.2f} MB")
+
+        # Step 4: Upload composite thumbnail to Destination R2
+        slug = supabase_get_next_slug()
+        final_title = (title or "").strip()
+        if not final_title:
+            final_title = make_rename(".mp4")
+
+        with task_lock:
+            current_task["current_stage"] = "Uploading composite thumbnail to Destination R2..."
+        thumb_size = thumb_file.stat().st_size if thumb_file.exists() else 0
+        thumb_path_rel = upload_thumb_to_r2(s3_dest, thumb_file, slug)
+        insert_thumbnail_to_db(thumb_path_rel, thumb_size)
+        if thumb_file.exists():
+            thumb_file.unlink()
+
+        # Step 5: Upload merged video to video hosts (AnonMP4, Abyss, ZeroStorage)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(accept_downloads=True)
+            page = context.new_page()
+            try:
+                with task_lock:
+                    current_task["current_stage"] = "Uploading merged video to AnonMP4..."
+                log("[AnonMP4] Uploading merged video...")
+                anon_url = upload_anonmp4_with_retry(page, merged_file)
+                log(f"✔ AnonMP4: {anon_url}")
+
+                with task_lock:
+                    current_task["current_stage"] = "Uploading merged video to Abyss..."
+                log("[Abyss] Uploading merged video...")
+                abyss_url = upload_abyss(merged_file)
+                log(f"✔ Abyss: {abyss_url}")
+
+                with task_lock:
+                    current_task["current_stage"] = "Uploading merged video to ZeroStorage..."
+                log("[ZeroStorage] Uploading merged video...")
+                zs_embed, zs_video = upload_zerostorage(merged_file)
+                log(f"✔ ZS Video: {zs_video}")
+            finally:
+                context.close()
+                browser.close()
+
+        # Step 6: Save record to Supabase & rich metadata to MongoDB
+        with task_lock:
+            current_task["current_stage"] = "Saving merged record to Supabase & MongoDB..."
+        record = {
+            "slug":        slug,
+            "title":       final_title,
+            "thumbnail":   thumb_path_rel,
+            "video_link":  zs_video,
+            "zerostorage": zs_embed,
+            "abyss":       abyss_url,
+            "anonmp4":     anon_url,
+        }
+        supabase_insert_video(record)
+
+        file_hash = calculate_file_hash(merged_file)
+        metadata = get_video_metadata(merged_file)
+        metadata_doc = {
+            "file_hash":        file_hash,
+            "slug":             slug,
+            "original_name":    f"merged_{slug}.mp4",
+            "title":            final_title,
+            "file_size":        metadata.get("file_size", merged_file.stat().st_size),
+            "duration":         metadata.get("duration", 0.0),
+            "width":            metadata.get("width", 0),
+            "height":           metadata.get("height", 0),
+            "aspect_ratio":     metadata.get("aspect_ratio_str", ""),
+            "video_codec":      metadata.get("video_codec", ""),
+            "audio_codec":      metadata.get("audio_codec", ""),
+            "format":           metadata.get("format", ""),
+            "thumbnail_path":   thumb_path_rel,
+            "created_at":       datetime.utcnow()
+        }
+        save_video_metadata(metadata_doc)
+
+        # Step 7: Delete original source videos from Source R2 and SQLite DB
+        with task_lock:
+            current_task["current_stage"] = f"Deleting {len(unique_video_keys)} merged source videos from Source R2..."
+        for k in unique_video_keys:
+            try:
+                delete_from_r2(s3_source, k)
+            except Exception as del_err:
+                log(f"Warning deleting {k}: {del_err}")
+
+        delete_from_db(keys=unique_video_keys, bucket_type="source")
+
+        log(f"✔ MERGE SUCCESSFUL: Merged {len(unique_video_keys)} videos into '{final_title}' (Slug: {slug})")
+        with task_lock:
+            current_task["completed"].append({"key": f"Merged: {final_title}", "slug": slug, "status": "success"})
+
+    except Exception as err:
+        log(f"✖ Merge Pipeline Error: {err}")
+        with task_lock:
+            current_task["failed"].append({"key": title or "Merged Video", "error": str(err)})
+    finally:
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+        with task_lock:
+            current_task["is_running"] = False
+            current_task["current_stage"] = "Merge Completed"
+            current_task["logs"].append("Merge process finished.")
+
 # ============================================================
 # FLASK WEB ENDPOINTS
 # ============================================================
@@ -383,6 +575,30 @@ def api_process():
     thread.start()
 
     return jsonify({"success": True, "count": len(video_keys), "message": f"Started processing {len(video_keys)} video(s)."})
+
+@app.route("/api/merge_process", methods=["POST"])
+def api_merge_process():
+    with task_lock:
+        if current_task["is_running"]:
+            return jsonify({"success": False, "error": "A task is already running. Please wait for it to finish."}), 400
+
+    payload = request.get_json() or {}
+    title = (payload.get("title") or "").strip()
+    video_keys = payload.get("video_keys", [])
+    thumb_keys = payload.get("thumb_keys", [])
+
+    if not video_keys:
+        return jsonify({"success": False, "error": "No videos selected for merging."}), 400
+
+    thread = threading.Thread(
+        target=merge_process_worker,
+        args=(title, video_keys, thumb_keys),
+        daemon=True
+    )
+    thread.start()
+
+    return jsonify({"success": True, "count": len(video_keys), "message": f"Started merge for {len(video_keys)} video(s)."})
+
 
 @app.route("/api/delete", methods=["POST"])
 def api_delete():
@@ -622,6 +838,11 @@ INDEX_HTML = """
       </div>
 
       <div class="flex items-center gap-2">
+        <button id="batchMergeBtn" onclick="openMergeModal()" class="px-3.5 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-semibold flex items-center gap-1.5 shadow transition-all cursor-pointer">
+          <i data-lucide="git-merge" class="w-3.5 h-3.5"></i>
+          <span>Download & Merge</span>
+        </button>
+
         <button id="batchProcessBtn" onclick="triggerProcessSelected()" class="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1.5 shadow transition-all cursor-pointer">
           <i data-lucide="download-cloud" class="w-3.5 h-3.5"></i>
           <span>Download & Process</span>
@@ -958,6 +1179,121 @@ INDEX_HTML = """
     </div>
   </div>
 
+  <!-- VIDEO MERGE MODAL (STEP 1: TITLE & SEQUENCE, STEP 2: THUMBNAIL SOURCE SELECTION) -->
+  <div id="mergeModal" class="hidden fixed inset-0 z-50 overflow-hidden flex items-center justify-center p-4 bg-black/85 backdrop-blur-md">
+    <div class="bg-zinc-900 border border-zinc-800 rounded-2xl max-w-2xl w-full p-5 shadow-2xl flex flex-col max-h-[90vh]">
+      
+      <!-- Modal Header -->
+      <div class="flex items-center justify-between pb-3 border-b border-zinc-800">
+        <div class="flex items-center gap-2.5">
+          <div class="h-9 w-9 rounded-xl bg-indigo-950/80 border border-indigo-800/80 text-indigo-400 grid place-items-center">
+            <i data-lucide="git-merge" class="w-4 h-4"></i>
+          </div>
+          <div>
+            <h3 id="mergeModalHeading" class="text-sm font-semibold text-white">Merge Selected Videos</h3>
+            <p id="mergeModalSubheading" class="text-[11px] text-zinc-400 font-mono">Step 1 of 2: Set Title & Video Sequence</p>
+          </div>
+        </div>
+        <button onclick="closeMergeModal()" class="text-zinc-400 hover:text-white p-1 rounded-lg hover:bg-zinc-800 transition-colors cursor-pointer">
+          <i data-lucide="x" class="w-5 h-5"></i>
+        </button>
+      </div>
+
+      <!-- Step 1 Container: Title and Ordered List -->
+      <div id="mergeStep1" class="py-4 space-y-4 flex-1 overflow-y-auto">
+        <!-- Title input -->
+        <div class="space-y-1.5">
+          <label class="block text-xs font-semibold text-zinc-200">
+            Merged Video Title <span class="text-indigo-400">*</span>
+          </label>
+          <input 
+            type="text" 
+            id="mergeTitleInput" 
+            class="w-full bg-zinc-950 border border-zinc-700 focus:border-indigo-500 rounded-xl px-3.5 py-2.5 text-xs text-white placeholder-zinc-500 outline-none font-mono"
+            placeholder="Enter title for merged video..."
+          >
+          <p class="text-[10.5px] text-zinc-500">This title will be used in Supabase, MongoDB, and video hosting records.</p>
+        </div>
+
+        <!-- Ordered videos list -->
+        <div class="space-y-2">
+          <div class="flex items-center justify-between text-xs">
+            <span class="font-semibold text-zinc-300 flex items-center gap-2">
+              <span>Merge Sequence Order:</span>
+              <span id="mergeSequenceCountBadge" class="text-[10px] font-mono px-2 py-0.5 rounded-full bg-indigo-950 text-indigo-300 border border-indigo-800">0 videos</span>
+            </span>
+            <span id="mergeDedupNotice" class="text-[10.5px] text-emerald-400 font-mono font-medium"></span>
+          </div>
+
+          <div id="mergeOrderList" class="space-y-2 max-h-60 overflow-y-auto pr-1">
+            <!-- Dynamically populated rows with numbers 1, 2, 3... and up/down/remove controls -->
+          </div>
+        </div>
+      </div>
+
+      <!-- Step 2 Container: Select Thumbnail Sources -->
+      <div id="mergeStep2" class="hidden py-4 space-y-4 flex-1 overflow-y-auto">
+        <div class="p-3.5 rounded-xl bg-indigo-950/40 border border-indigo-900/60 flex items-start gap-3">
+          <div class="p-1.5 rounded-lg bg-indigo-900/50 text-indigo-400 shrink-0">
+            <i data-lucide="sparkles" class="w-4 h-4"></i>
+          </div>
+          <div>
+            <h4 class="text-xs font-semibold text-indigo-200">Kon-kon sa videos se thumbnail nikalna hain?</h4>
+            <p class="text-[11px] text-zinc-400 mt-0.5">Select which videos should provide the first frame for the thumbnail cover image. Selected frames will be merged into a composite 1280x720 thumbnail.</p>
+          </div>
+        </div>
+
+        <div class="flex items-center justify-between text-xs px-1">
+          <span class="text-zinc-400 font-mono text-[11px]" id="mergeThumbSelectCount">0 videos selected for thumbnail</span>
+          <button type="button" onclick="toggleAllMergeThumbs()" class="text-indigo-400 hover:text-indigo-300 text-[11px] font-medium cursor-pointer">
+            Select All / None
+          </button>
+        </div>
+
+        <div id="mergeThumbnailsGrid" class="grid grid-cols-1 sm:grid-cols-2 gap-2.5 max-h-64 overflow-y-auto pr-1">
+          <!-- Dynamically populated video cards with checkboxes -->
+        </div>
+      </div>
+
+      <!-- Modal Footer Buttons -->
+      <div class="pt-3 border-t border-zinc-800 flex items-center justify-between">
+        <button 
+          id="mergeBtnBack" 
+          onclick="mergeStepBack()" 
+          class="hidden px-3.5 py-1.5 rounded-lg border border-zinc-700 bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-zinc-300 transition-colors cursor-pointer"
+        >
+          &larr; Back to Order & Title
+        </button>
+        <div class="flex items-center gap-2 ml-auto">
+          <button 
+            onclick="closeMergeModal()" 
+            class="px-3.5 py-1.5 rounded-lg border border-zinc-700 bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-zinc-300 transition-colors cursor-pointer"
+          >
+            Cancel
+          </button>
+          <button 
+            id="mergeBtnNext" 
+            onclick="mergeStepNext()" 
+            class="px-4 py-1.5 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-xs font-semibold text-white shadow flex items-center gap-1.5 transition-colors cursor-pointer"
+          >
+            <span>Next: Choose Thumbnail Videos</span>
+            <i data-lucide="arrow-right" class="w-3.5 h-3.5"></i>
+          </button>
+          <button 
+            id="mergeBtnSubmit" 
+            onclick="executeMergeProcess()" 
+            class="hidden px-4 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-xs font-semibold text-white shadow flex items-center gap-1.5 transition-colors cursor-pointer"
+          >
+            <i data-lucide="git-merge" class="w-3.5 h-3.5"></i>
+            <span>Start Merge & Upload</span>
+          </button>
+        </div>
+      </div>
+
+    </div>
+  </div>
+
+
   <!-- TOAST -->
   <div id="copyToast" class="fixed bottom-6 right-6 z-50 bg-emerald-600 text-white text-xs font-mono px-4 py-2 rounded-xl shadow-2xl opacity-0 translate-y-3 pointer-events-none flex items-center gap-2">
     <i data-lucide="check" class="w-4 h-4"></i>
@@ -1045,7 +1381,13 @@ INDEX_HTML = """
     // Selected items (Set of keys or folder prefixes)
     let selectedFiles = new Set();
     let selectedFolders = new Set();
+    let selectedVideoOrder = []; // Ordered sequence of keys for video merging & numbered badges
     let currentlyPlayingKey = "";
+
+    function isVideoKey(k) {
+      const lower = (k || "").toLowerCase();
+      return [".mp4", ".mkv", ".avi", ".mov", ".webm", ".flv"].some(ext => lower.endsWith(ext));
+    }
 
     function formatBytes(bytes) {
       if (!bytes || bytes === 0) return "0 B";
@@ -1062,6 +1404,7 @@ INDEX_HTML = """
       activeTab = tab;
       selectedFiles.clear();
       selectedFolders.clear();
+      selectedVideoOrder = [];
       updateSelectionUI();
 
       const tabs = ["explorer", "images", "videos", "thumbnails"];
@@ -1388,14 +1731,16 @@ INDEX_HTML = """
 
       let html = "";
       filtered.forEach(vid => {
-        const isSelected = selectedFiles.has(vid.key);
+        const orderIdx = selectedVideoOrder.indexOf(vid.key);
+        const orderNum = orderIdx >= 0 ? orderIdx + 1 : 0;
+        const isSelected = orderNum > 0;
         const safeKey = vid.key.replace(/'/g, "\\\\'");
         const safeName = vid.name.replace(/'/g, "\\\\'");
         const directUrl = vid.direct_url;
         const streamUrl = vid.stream_url;
 
         html += `
-          <div class="bg-zinc-900 border ${isSelected ? 'border-rose-500 bg-rose-950/20' : 'border-zinc-800'} rounded-xl overflow-hidden flex flex-col justify-between hover:border-zinc-700 transition-all shadow-xs group">
+          <div class="bg-zinc-900 border ${isSelected ? 'border-blue-500 bg-blue-950/20 ring-1 ring-blue-500/50' : 'border-zinc-800'} rounded-xl overflow-hidden flex flex-col justify-between hover:border-zinc-700 transition-all shadow-xs group">
             
             <div class="relative w-full aspect-video bg-black overflow-hidden border-b border-zinc-800/80">
               <video 
@@ -1418,13 +1763,19 @@ INDEX_HTML = """
                 </div>
               </div>
 
-              <div class="absolute top-2 left-2 z-10 bg-zinc-950/70 p-1 rounded backdrop-blur">
-                <input 
-                  type="checkbox" 
-                  ${isSelected ? 'checked' : ''} 
-                  onchange="toggleSelectFile('${vid.key}', this.checked)" 
-                  class="rounded bg-zinc-800 border-zinc-700 text-rose-500 focus:ring-0 cursor-pointer block"
+              <div class="absolute top-2 left-2 z-10">
+                <button 
+                  type="button" 
+                  onclick="event.stopPropagation(); toggleVideoSelect('${safeKey}')" 
+                  class="w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs shadow-lg transition-all cursor-pointer ${
+                    isSelected 
+                      ? 'bg-blue-600 text-white ring-2 ring-white scale-110' 
+                      : 'bg-zinc-950/80 border-2 border-zinc-400 text-zinc-400 hover:border-blue-400 hover:text-white backdrop-blur'
+                  }"
+                  title="${isSelected ? 'Selected #' + orderNum + ' in merge sequence (Click to remove)' : 'Click to select in merge sequence'}"
                 >
+                  ${isSelected ? orderNum : '<span class="w-1.5 h-1.5 rounded-full bg-zinc-400"></span>'}
+                </button>
               </div>
 
               <span class="absolute top-2 right-2 text-[9.5px] font-mono font-semibold px-1.5 py-0.5 rounded bg-rose-950/90 text-rose-300 border border-rose-800/60 shadow">
@@ -1657,14 +2008,16 @@ INDEX_HTML = """
 
         // File Cards
         files.forEach(file => {
-          const isSelected = selectedFiles.has(file.key);
+          const orderIdx = selectedVideoOrder.indexOf(file.key);
+          const orderNum = orderIdx >= 0 ? orderIdx + 1 : 0;
+          const isSelected = file.is_video ? (orderNum > 0) : selectedFiles.has(file.key);
           const safeKey = file.key.replace(/'/g, "\\\\'");
           const safeName = file.name.replace(/'/g, "\\\\'");
           const directUrl = file.direct_url;
           const streamUrl = file.stream_url;
 
           html += `
-            <div class="bg-zinc-900 border ${isSelected ? 'border-blue-500 bg-blue-950/20' : 'border-zinc-800'} rounded-xl overflow-hidden flex flex-col justify-between hover:border-zinc-700 transition-all shadow-xs group">
+            <div class="bg-zinc-900 border ${isSelected ? 'border-blue-500 bg-blue-950/20 ring-1 ring-blue-500/50' : 'border-zinc-800'} rounded-xl overflow-hidden flex flex-col justify-between hover:border-zinc-700 transition-all shadow-xs group">
               <div class="relative w-full aspect-video bg-black overflow-hidden border-b border-zinc-800/80">
                 ${file.is_video ? `
                   <video 
@@ -1699,9 +2052,26 @@ INDEX_HTML = """
                   </div>
                 `}
 
-                <div class="absolute top-2 left-2 z-10 bg-zinc-950/70 p-1 rounded backdrop-blur">
-                  <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelectFile('${file.key}', this.checked)" class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer block">
-                </div>
+                ${file.is_video ? `
+                  <div class="absolute top-2 left-2 z-10">
+                    <button 
+                      type="button" 
+                      onclick="event.stopPropagation(); toggleVideoSelect('${safeKey}')" 
+                      class="w-7 h-7 rounded-full flex items-center justify-center font-bold text-xs shadow-lg transition-all cursor-pointer ${
+                        isSelected 
+                          ? 'bg-blue-600 text-white ring-2 ring-white scale-110' 
+                          : 'bg-zinc-950/80 border-2 border-zinc-400 text-zinc-400 hover:border-blue-400 hover:text-white backdrop-blur'
+                      }"
+                      title="${isSelected ? 'Selected #' + orderNum + ' in merge sequence (Click to remove)' : 'Click to select in merge sequence'}"
+                    >
+                      ${isSelected ? orderNum : '<span class="w-1.5 h-1.5 rounded-full bg-zinc-400"></span>'}
+                    </button>
+                  </div>
+                ` : `
+                  <div class="absolute top-2 left-2 z-10 bg-zinc-950/70 p-1 rounded backdrop-blur">
+                    <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelectFile('${file.key}', this.checked)" class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer block">
+                  </div>
+                `}
               </div>
 
               <div class="p-3 space-y-1">
@@ -1785,7 +2155,9 @@ INDEX_HTML = """
         });
 
         files.forEach(file => {
-          const isSelected = selectedFiles.has(file.key);
+          const orderIdx = selectedVideoOrder.indexOf(file.key);
+          const orderNum = orderIdx >= 0 ? orderIdx + 1 : 0;
+          const isSelected = file.is_video ? (orderNum > 0) : selectedFiles.has(file.key);
           const safeKey = file.key.replace(/'/g, "\\\\'");
           const safeName = file.name.replace(/'/g, "\\\\'");
           const directUrl = file.direct_url;
@@ -1794,7 +2166,22 @@ INDEX_HTML = """
           html += `
             <div class="px-4 py-2 flex items-center justify-between hover:bg-zinc-800/40 transition-colors ${isSelected ? 'bg-blue-950/20' : ''}">
               <div class="flex items-center gap-3 min-w-0">
-                <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelectFile('${file.key}', this.checked)" class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer">
+                ${file.is_video ? `
+                  <button 
+                    type="button" 
+                    onclick="event.stopPropagation(); toggleVideoSelect('${safeKey}')" 
+                    class="w-5 h-5 rounded-full flex items-center justify-center font-bold text-[10px] shadow transition-all cursor-pointer ${
+                      orderNum > 0 
+                        ? 'bg-blue-600 text-white ring-1 ring-white' 
+                        : 'bg-zinc-800 border border-zinc-600 text-zinc-400 hover:border-white'
+                    }"
+                    title="${orderNum > 0 ? 'Selected #' + orderNum : 'Select'}"
+                  >
+                    ${orderNum > 0 ? orderNum : ''}
+                  </button>
+                ` : `
+                  <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelectFile('${file.key}', this.checked)" class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer">
+                `}
                 
                 <div class="w-12 h-8 rounded bg-black border border-zinc-800 overflow-hidden relative shrink-0">
                   ${file.is_video ? `
@@ -2032,15 +2419,43 @@ INDEX_HTML = """
       updateSelectionUI();
     }
 
-    function toggleSelectFile(key, isChecked) {
-      if (isChecked) selectedFiles.add(key);
-      else selectedFiles.delete(key);
+    function toggleVideoSelect(key) {
+      const idx = selectedVideoOrder.indexOf(key);
+      if (idx >= 0) {
+        selectedVideoOrder.splice(idx, 1);
+        selectedFiles.delete(key);
+      } else {
+        selectedVideoOrder.push(key);
+        selectedFiles.add(key);
+      }
       updateSelectionUI();
+      if (activeTab === "videos") renderAllVideosView();
+      else if (activeTab === "explorer") renderExplorerView();
+    }
+
+    function toggleSelectFile(key, isChecked) {
+      if (isVideoKey(key)) {
+        if (isChecked) {
+          if (!selectedVideoOrder.includes(key)) selectedVideoOrder.push(key);
+          selectedFiles.add(key);
+        } else {
+          selectedVideoOrder = selectedVideoOrder.filter(k => k !== key);
+          selectedFiles.delete(key);
+        }
+      } else {
+        if (isChecked) selectedFiles.add(key);
+        else selectedFiles.delete(key);
+      }
+      updateSelectionUI();
+      if (activeTab === "videos") renderAllVideosView();
+      else if (activeTab === "explorer") renderExplorerView();
+      else if (activeTab === "images") renderAllImagesView();
     }
 
     function clearSelection() {
       selectedFolders.clear();
       selectedFiles.clear();
+      selectedVideoOrder = [];
       updateSelectionUI();
       if (activeTab === "explorer") renderExplorerView();
       else if (activeTab === "images") renderAllImagesView();
@@ -2051,17 +2466,25 @@ INDEX_HTML = """
       const header = document.getElementById("selectionHeader");
       const text = document.getElementById("selectedCountText");
       const processBtn = document.getElementById("batchProcessBtn");
+      const mergeBtn = document.getElementById("batchMergeBtn");
       const total = selectedFolders.size + selectedFiles.size;
+      const vCount = selectedVideoOrder.length;
 
       if (total > 0) {
         header.classList.remove("hidden");
-        text.innerText = `${total} item(s) selected (${selectedFolders.size} folder${selectedFolders.size === 1 ? '' : 's'}, ${selectedFiles.size} file${selectedFiles.size === 1 ? '' : 's'})`;
+        text.innerText = `${total} item(s) selected (${selectedFolders.size} folder${selectedFolders.size === 1 ? '' : 's'}, ${selectedFiles.size} file${selectedFiles.size === 1 ? '' : 's'}${vCount > 0 ? ' • ' + vCount + ' in merge sequence' : ''})`;
         
-        // Hide Process button if on Images view
+        // Hide Process/Merge button if on Images view
         if (activeTab === "images") {
           processBtn?.classList.add("hidden");
+          mergeBtn?.classList.add("hidden");
         } else {
           processBtn?.classList.remove("hidden");
+          if (vCount >= 2) {
+            mergeBtn?.classList.remove("hidden");
+          } else {
+            mergeBtn?.classList.add("hidden");
+          }
         }
       } else {
         header.classList.add("hidden");
@@ -2096,6 +2519,7 @@ INDEX_HTML = """
     function triggerProcessFolder(folderPrefix) {
       selectedFolders.clear();
       selectedFiles.clear();
+      selectedVideoOrder = [];
       selectedFolders.add(folderPrefix);
       triggerProcessSelected();
     }
@@ -2103,8 +2527,265 @@ INDEX_HTML = """
     function triggerProcessSingle(fileKey) {
       selectedFolders.clear();
       selectedFiles.clear();
+      selectedVideoOrder = [];
       selectedFiles.add(fileKey);
       triggerProcessSelected();
+    }
+
+    // ------------------------------------------------------------
+    // VIDEO MERGE WORKFLOW (ORDERED SELECTION & CUSTOM THUMBNAIL)
+    // ------------------------------------------------------------
+    let mergeSelectedThumbKeys = new Set();
+
+    function openMergeModal() {
+      if (selectedVideoOrder.length < 2) {
+        alert("Please select at least 2 videos using the numbered selection (1, 2, 3...) to merge them in sequence.");
+        return;
+      }
+
+      // Deduplicate selected video keys while preserving sequence order
+      const originalCount = selectedVideoOrder.length;
+      const seen = new Set();
+      selectedVideoOrder = selectedVideoOrder.filter(k => !seen.has(k) && seen.add(k));
+      const dedupRemoved = originalCount - selectedVideoOrder.length;
+
+      const dedupNoticeEl = document.getElementById("mergeDedupNotice");
+      if (dedupNoticeEl) {
+        dedupNoticeEl.innerText = dedupRemoved > 0 ? `✔ ${dedupRemoved} duplicate video(s) removed` : "";
+      }
+
+      // Set default title based on first video name
+      const titleInput = document.getElementById("mergeTitleInput");
+      if (titleInput) {
+        const firstBasename = selectedVideoOrder[0].split("/").pop().replace(/\.[^/.]+$/, "");
+        titleInput.value = firstBasename.replace(/[-_]/g, " ") + " (Merged)";
+      }
+
+      // Reset to Step 1
+      document.getElementById("mergeStep1").classList.remove("hidden");
+      document.getElementById("mergeStep2").classList.add("hidden");
+      document.getElementById("mergeBtnBack").classList.add("hidden");
+      document.getElementById("mergeBtnNext").classList.remove("hidden");
+      document.getElementById("mergeBtnSubmit").classList.add("hidden");
+      document.getElementById("mergeModalHeading").innerText = "Merge Selected Videos";
+      document.getElementById("mergeModalSubheading").innerText = "Step 1 of 2: Set Title & Video Sequence";
+
+      renderMergeOrderList();
+      document.getElementById("mergeModal").classList.remove("hidden");
+      lucide.createIcons();
+    }
+
+    function closeMergeModal() {
+      document.getElementById("mergeModal").classList.add("hidden");
+    }
+
+    function renderMergeOrderList() {
+      const listEl = document.getElementById("mergeOrderList");
+      const badgeEl = document.getElementById("mergeSequenceCountBadge");
+      if (badgeEl) badgeEl.innerText = `${selectedVideoOrder.length} videos`;
+
+      let html = "";
+      selectedVideoOrder.forEach((key, idx) => {
+        const num = idx + 1;
+        const filename = key.split("/").pop();
+        const isFirst = idx === 0;
+        const isLast = idx === selectedVideoOrder.length - 1;
+
+        html += `
+          <div class="p-2.5 rounded-xl bg-zinc-950 border border-zinc-800 flex items-center justify-between gap-3 group hover:border-zinc-700 transition-all">
+            <div class="flex items-center gap-3 min-w-0">
+              <span class="w-6 h-6 rounded-full bg-blue-600 text-white font-bold text-xs flex items-center justify-center shrink-0 shadow">
+                ${num}
+              </span>
+              <div class="min-w-0">
+                <div class="text-xs font-semibold text-white font-mono truncate" title="${key}">${filename}</div>
+                <div class="text-[10px] text-zinc-500 font-mono truncate">${key}</div>
+              </div>
+            </div>
+            
+            <div class="flex items-center gap-1 shrink-0">
+              <button 
+                type="button" 
+                onclick="moveMergeVideo(${idx}, -1)" 
+                ${isFirst ? 'disabled class="p-1 rounded text-zinc-700 cursor-not-allowed"' : 'class="p-1 rounded text-zinc-400 hover:text-white hover:bg-zinc-800 cursor-pointer"'} 
+                title="Move Up"
+              >
+                <i data-lucide="chevron-up" class="w-4 h-4"></i>
+              </button>
+              <button 
+                type="button" 
+                onclick="moveMergeVideo(${idx}, 1)" 
+                ${isLast ? 'disabled class="p-1 rounded text-zinc-700 cursor-not-allowed"' : 'class="p-1 rounded text-zinc-400 hover:text-white hover:bg-zinc-800 cursor-pointer"'} 
+                title="Move Down"
+              >
+                <i data-lucide="chevron-down" class="w-4 h-4"></i>
+              </button>
+              <button 
+                type="button" 
+                onclick="removeMergeVideo(${idx})" 
+                class="p-1 rounded text-zinc-500 hover:text-rose-400 hover:bg-rose-950/40 cursor-pointer transition-colors" 
+                title="Remove from merge"
+              >
+                <i data-lucide="trash-2" class="w-4 h-4"></i>
+              </button>
+            </div>
+          </div>
+        `;
+      });
+
+      listEl.innerHTML = html;
+      lucide.createIcons();
+    }
+
+    function moveMergeVideo(index, direction) {
+      const newIndex = index + direction;
+      if (newIndex < 0 || newIndex >= selectedVideoOrder.length) return;
+      const temp = selectedVideoOrder[index];
+      selectedVideoOrder[index] = selectedVideoOrder[newIndex];
+      selectedVideoOrder[newIndex] = temp;
+      renderMergeOrderList();
+      updateSelectionUI();
+      if (activeTab === "videos") renderAllVideosView();
+      else if (activeTab === "explorer") renderExplorerView();
+    }
+
+    function removeMergeVideo(index) {
+      if (selectedVideoOrder.length <= 2) {
+        alert("At least 2 videos are required to merge.");
+        return;
+      }
+      const removedKey = selectedVideoOrder.splice(index, 1)[0];
+      selectedFiles.delete(removedKey);
+      renderMergeOrderList();
+      updateSelectionUI();
+      if (activeTab === "videos") renderAllVideosView();
+      else if (activeTab === "explorer") renderExplorerView();
+    }
+
+    function mergeStepNext() {
+      const title = (document.getElementById("mergeTitleInput").value || "").trim();
+      if (!title) {
+        alert("Please enter a title for the merged video.");
+        document.getElementById("mergeTitleInput").focus();
+        return;
+      }
+
+      // Transition to Step 2
+      document.getElementById("mergeStep1").classList.add("hidden");
+      document.getElementById("mergeStep2").classList.remove("hidden");
+      document.getElementById("mergeBtnBack").classList.remove("hidden");
+      document.getElementById("mergeBtnNext").classList.add("hidden");
+      document.getElementById("mergeBtnSubmit").classList.remove("hidden");
+      document.getElementById("mergeModalHeading").innerText = "Select Thumbnail Sources";
+      document.getElementById("mergeModalSubheading").innerText = "Step 2 of 2: Kon-kon sa videos se thumbnail nikalna hain?";
+
+      // Default: select up to 4 chosen videos for thumbnail extraction
+      mergeSelectedThumbKeys = new Set(selectedVideoOrder.slice(0, 4));
+      renderMergeThumbGrid();
+      lucide.createIcons();
+    }
+
+    function mergeStepBack() {
+      document.getElementById("mergeStep1").classList.remove("hidden");
+      document.getElementById("mergeStep2").classList.add("hidden");
+      document.getElementById("mergeBtnBack").classList.add("hidden");
+      document.getElementById("mergeBtnNext").classList.remove("hidden");
+      document.getElementById("mergeBtnSubmit").classList.add("hidden");
+      document.getElementById("mergeModalHeading").innerText = "Merge Selected Videos";
+      document.getElementById("mergeModalSubheading").innerText = "Step 1 of 2: Set Title & Video Sequence";
+      lucide.createIcons();
+    }
+
+    function renderMergeThumbGrid() {
+      const gridEl = document.getElementById("mergeThumbnailsGrid");
+      const countEl = document.getElementById("mergeThumbSelectCount");
+      if (countEl) countEl.innerText = `${mergeSelectedThumbKeys.size} video(s) selected for thumbnail`;
+
+      let html = "";
+      selectedVideoOrder.forEach((key, idx) => {
+        const isChecked = mergeSelectedThumbKeys.has(key);
+        const filename = key.split("/").pop();
+        const safeKey = key.replace(/'/g, "\\\\'");
+        const directUrl = `/api/media/stream?target=source&key=${encodeURIComponent(key)}`;
+
+        html += `
+          <label class="p-2.5 rounded-xl border ${isChecked ? 'border-indigo-500 bg-indigo-950/30 ring-1 ring-indigo-500/50' : 'border-zinc-800 bg-zinc-950'} flex items-center gap-3 cursor-pointer hover:border-zinc-700 transition-all select-none">
+            <input 
+              type="checkbox" 
+              ${isChecked ? 'checked' : ''} 
+              onchange="toggleMergeThumbKey('${safeKey}', this.checked)" 
+              class="rounded bg-zinc-800 border-zinc-700 text-indigo-500 focus:ring-0 cursor-pointer shrink-0"
+            >
+            <div class="w-12 h-8 rounded bg-black border border-zinc-800 overflow-hidden relative shrink-0">
+              <video src="${directUrl}#t=0.5" preload="metadata" muted playsinline class="w-full h-full object-cover"></video>
+            </div>
+            <div class="min-w-0 flex-1">
+              <div class="text-xs font-semibold text-white font-mono truncate" title="${key}">${filename}</div>
+              <div class="text-[10px] text-zinc-400 font-mono">Video #${idx + 1}</div>
+            </div>
+          </label>
+        `;
+      });
+
+      gridEl.innerHTML = html;
+    }
+
+    function toggleMergeThumbKey(key, isChecked) {
+      if (isChecked) mergeSelectedThumbKeys.add(key);
+      else mergeSelectedThumbKeys.delete(key);
+      renderMergeThumbGrid();
+    }
+
+    function toggleAllMergeThumbs() {
+      if (mergeSelectedThumbKeys.size === selectedVideoOrder.length) {
+        mergeSelectedThumbKeys.clear();
+      } else {
+        mergeSelectedThumbKeys = new Set(selectedVideoOrder);
+      }
+      renderMergeThumbGrid();
+    }
+
+    async function executeMergeProcess() {
+      const title = (document.getElementById("mergeTitleInput").value || "").trim();
+      if (!title) {
+        alert("Please enter a title for the merged video.");
+        mergeStepBack();
+        return;
+      }
+
+      const thumbKeysArray = Array.from(mergeSelectedThumbKeys);
+      if (thumbKeysArray.length === 0) {
+        if (!confirm("No videos selected for thumbnail extraction. Use the first video as default?")) {
+          return;
+        }
+        thumbKeysArray.push(selectedVideoOrder[0]);
+      }
+
+      const payload = {
+        title: title,
+        video_keys: selectedVideoOrder,
+        thumb_keys: thumbKeysArray
+      };
+
+      closeMergeModal();
+
+      try {
+        const res = await fetch("/api/merge_process", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const json = await res.json();
+        if (json.success) {
+          clearSelection();
+          openTaskModal();
+          showToast("Video merge task started!");
+        } else {
+          alert("Failed to start merge: " + (json.error || "Unknown error"));
+        }
+      } catch (err) {
+        alert("Error requesting merge: " + err);
+      }
     }
 
     // ------------------------------------------------------------
@@ -2299,6 +2980,7 @@ INDEX_HTML = """
         closeImageModal();
         closeTaskModal();
         closeDeleteModal();
+        closeMergeModal();
       }
     });
 

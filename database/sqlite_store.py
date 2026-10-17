@@ -4,6 +4,7 @@ import sqlite3
 import time
 import threading
 from pathlib import Path
+from datetime import datetime
 from urllib.parse import quote
 from config import (
     SOURCE_R2_ENDPOINT,
@@ -155,11 +156,11 @@ def sync_r2_buckets(s3_source, s3_dest, log_cb=None):
                         obj.get("Size", 0), last_mod, d_url, s_url, now_ts
                     ))
 
-        # 2. SCAN DESTINATION R2 BUCKET (Thumbnails)
+        # 2. SCAN DESTINATION R2 BUCKET (Thumbnails - only scan new_thumbnails/ folder)
         if s3_dest and DEST_R2_BUCKET:
-            _log(f"Scanning Destination R2 bucket '{DEST_R2_BUCKET}'...")
+            _log(f"Scanning Destination R2 bucket '{DEST_R2_BUCKET}' (prefix: new_thumbnails/)...")
             paginator = s3_dest.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=DEST_R2_BUCKET):
+            for page in paginator.paginate(Bucket=DEST_R2_BUCKET, Prefix="new_thumbnails/"):
                 for obj in page.get("Contents", []):
                     key = obj["Key"]
                     if key.endswith("/"):
@@ -213,7 +214,7 @@ def sync_r2_buckets(s3_source, s3_dest, log_cb=None):
                 if source_keys:
                     conn.execute("DELETE FROM media_items WHERE bucket_type='source' AND synced_at != ?", (now_ts,))
                 if dest_keys:
-                    conn.execute("DELETE FROM media_items WHERE bucket_type='dest' AND synced_at != ?", (now_ts,))
+                    conn.execute("DELETE FROM media_items WHERE bucket_type='dest' AND key LIKE 'new_thumbnails/%' AND synced_at != ?", (now_ts,))
 
                 conn.commit()
             finally:
@@ -511,3 +512,42 @@ def delete_from_db(keys=None, prefixes=None, bucket_type="source"):
             conn.commit()
         finally:
             conn.close()
+
+def insert_thumbnail_to_db(key: str, size: int = 0):
+    """
+    Inserts or updates newly uploaded thumbnail in SQLite so it appears instantly.
+    """
+    with _db_lock:
+        conn = get_connection()
+        try:
+            filename = Path(key).name
+            folder = str(Path(key).parent).replace("\\", "/")
+            if folder == ".":
+                folder = ""
+            elif not folder.endswith("/"):
+                folder += "/"
+            ext = Path(key).suffix.lower() or ".jpg"
+            last_mod = datetime.now().strftime("%Y-%m-%d %H:%M")
+            d_url = make_direct_url("dest", DEST_R2_BUCKET, key)
+            s_url = make_stream_url("dest", key)
+            now_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            conn.execute("""
+                INSERT INTO media_items (
+                    bucket_type, bucket_name, key, filename, folder, ext, file_type,
+                    size, last_modified, direct_url, stream_url, synced_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    size=excluded.size,
+                    last_modified=excluded.last_modified,
+                    direct_url=excluded.direct_url,
+                    stream_url=excluded.stream_url,
+                    synced_at=excluded.synced_at
+            """, (
+                "dest", DEST_R2_BUCKET, key, filename, folder, ext, "thumbnail",
+                size, last_mod, d_url, s_url, now_ts
+            ))
+            conn.commit()
+        finally:
+            conn.close()
+
