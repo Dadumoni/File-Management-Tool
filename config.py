@@ -12,12 +12,14 @@ SOURCE_R2_ENDPOINT = os.getenv("SOURCE_R2_ENDPOINT") or os.getenv("R2_ENDPOINT")
 SOURCE_R2_ACCESS_KEY = os.getenv("SOURCE_R2_ACCESS_KEY") or os.getenv("R2_ACCESS_KEY")
 SOURCE_R2_SECRET_KEY = os.getenv("SOURCE_R2_SECRET_KEY") or os.getenv("R2_SECRET_KEY")
 SOURCE_R2_BUCKET = os.getenv("SOURCE_R2_BUCKET") or os.getenv("R2_BUCKET")
+SOURCE_R2_PUBLIC_URL = (os.getenv("SOURCE_R2_PUBLIC_URL") or "").rstrip("/")
 
 # Destination R2 (Thumbnail Upload to new_thumbnails)
 DEST_R2_ENDPOINT = os.getenv("DEST_R2_ENDPOINT") or SOURCE_R2_ENDPOINT
 DEST_R2_ACCESS_KEY = os.getenv("DEST_R2_ACCESS_KEY") or SOURCE_R2_ACCESS_KEY
 DEST_R2_SECRET_KEY = os.getenv("DEST_R2_SECRET_KEY") or SOURCE_R2_SECRET_KEY
 DEST_R2_BUCKET = os.getenv("DEST_R2_BUCKET") or SOURCE_R2_BUCKET
+DEST_R2_PUBLIC_URL = (os.getenv("DEST_R2_PUBLIC_URL") or "").rstrip("/")
 
 # ============================================================
 # SUPABASE CONFIGURATION

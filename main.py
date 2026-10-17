@@ -10,7 +10,9 @@ from playwright.sync_api import sync_playwright
 from config import (
     validate_config,
     SOURCE_R2_BUCKET,
-    DEST_R2_BUCKET
+    SOURCE_R2_PUBLIC_URL,
+    DEST_R2_BUCKET,
+    DEST_R2_PUBLIC_URL
 )
 from storage.r2_client import (
     create_r2_clients,
@@ -24,6 +26,17 @@ from storage.r2_client import (
     list_destination_thumbnails,
     delete_from_dest_r2,
     get_bucket_counts
+)
+from database.sqlite_store import (
+    init_db,
+    start_background_sync,
+    get_counts,
+    list_directory_from_db,
+    list_all_images_from_db,
+    list_all_videos_from_db,
+    list_thumbnails_from_db,
+    delete_from_db,
+    sync_state
 )
 from database.supabase_client import (
     supabase_init_table,
@@ -77,7 +90,10 @@ def init_services():
         validate_config()
         s3_source, s3_dest = create_r2_clients()
         supabase_init_table()
-        log("✔ S3 R2 Clients and Supabase table initialized successfully.")
+        init_db()
+        # Scan both buckets automatically as soon as app starts/deploys
+        start_background_sync(s3_source, s3_dest, log)
+        log("✔ S3 R2 Clients, Supabase table, and SQLite background scanner started.")
     except Exception as e:
         log(f"✖ Service initialization warning: {e}")
 
@@ -193,6 +209,7 @@ def process_single_video(page, key: str, temp_dir: Path, processed_titles: set):
             local_file.unlink()
 
         delete_from_r2(s3_source, key)
+        delete_from_db(keys=[key], bucket_type="source")
         log(f"✔ COMPLETED SUCCESSFULLY: {orig_name}")
 
         with task_lock:
@@ -253,8 +270,64 @@ def health():
 def api_files():
     prefix = request.args.get("prefix", "")
     try:
-        data = list_directory(s3_source, prefix)
+        data = list_directory_from_db(prefix)
         return jsonify({"success": True, "data": data})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/images")
+def api_images():
+    search = request.args.get("search", "")
+    try:
+        images = list_all_images_from_db(search)
+        return jsonify({"success": True, "images": images, "total": len(images)})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/videos")
+def api_videos():
+    search = request.args.get("search", "")
+    try:
+        videos = list_all_videos_from_db(search)
+        return jsonify({"success": True, "videos": videos, "total": len(videos)})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/thumbnails")
+def api_thumbnails():
+    search = request.args.get("search", "")
+    try:
+        data = list_thumbnails_from_db(search)
+        return jsonify({"success": True, "thumbnails": data, "bucket": DEST_R2_BUCKET})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/thumbnails/delete", methods=["POST"])
+def api_thumbnails_delete():
+    payload = request.get_json() or {}
+    key = payload.get("key", "")
+    if not key:
+        return jsonify({"success": False, "error": "No thumbnail key provided."}), 400
+    try:
+        delete_from_dest_r2(s3_dest, key)
+        delete_from_db(keys=[key], bucket_type="dest")
+        return jsonify({"success": True, "key": key})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/stats")
+def api_stats():
+    try:
+        stats = get_counts()
+        return jsonify({"success": True, "stats": stats})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+@app.route("/api/sync", methods=["POST"])
+def api_sync():
+    try:
+        start_background_sync(s3_source, s3_dest, log)
+        return jsonify({"success": True, "message": "R2 buckets scan started in background."})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
 
@@ -291,6 +364,7 @@ def api_delete():
 
     try:
         deleted_count = delete_targets_from_r2(s3_source, keys, folders)
+        delete_from_db(keys=keys, prefixes=folders, bucket_type="source")
         return jsonify({"success": True, "deleted_count": deleted_count})
     except Exception as e:
         return jsonify({"success": False, "error": str(e)}), 500
@@ -312,9 +386,9 @@ def api_task_status():
 @app.route("/api/media/stream")
 def media_stream():
     """
-    Streams media (videos and images) from Source or Destination R2.
-    Supports HTTP 206 Partial Content (Range requests) so modern browsers can
-    instantly load the video's first frame or seek without downloading the whole file.
+    Direct / streaming endpoint with Range request support for videos and images.
+    If public URL is configured, redirects directly. Otherwise generates presigned redirect
+    or streams bytes fallback.
     """
     key = request.args.get("key", "")
     target = request.args.get("target", "source")
@@ -345,6 +419,11 @@ def media_stream():
         content_type = "video/3gpp"
 
     try:
+        public_url = SOURCE_R2_PUBLIC_URL if target == "source" else DEST_R2_PUBLIC_URL
+        if public_url:
+            clean_key = quote(key.lstrip("/"), safe="/:@")
+            return redirect(f"{public_url.rstrip('/')}/{clean_key}", code=302)
+
         presigned_url = client.generate_presigned_url(
             "get_object",
             Params={"Bucket": bucket, "Key": key},
@@ -352,41 +431,13 @@ def media_stream():
         )
         return redirect(presigned_url, code=302)
     except Exception as e:
-        log(f"Presigned error for {key}, attempting direct stream: {e}")
+        log(f"Media stream redirect warning for {key}: {e}")
         try:
             s3_res = client.get_object(Bucket=bucket, Key=key)
             return Response(s3_res["Body"].read(), status=200, content_type=content_type)
         except Exception as inner_err:
             log(f"Media stream failed: {inner_err}")
             return f"Streaming error: {inner_err}", 500
-
-@app.route("/api/thumbnails")
-def api_thumbnails():
-    try:
-        data = list_destination_thumbnails(s3_dest)
-        return jsonify({"success": True, "thumbnails": data, "bucket": DEST_R2_BUCKET})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route("/api/thumbnails/delete", methods=["POST"])
-def api_thumbnails_delete():
-    payload = request.get_json() or {}
-    key = payload.get("key", "")
-    if not key:
-        return jsonify({"success": False, "error": "No thumbnail key provided."}), 400
-    try:
-        delete_from_dest_r2(s3_dest, key)
-        return jsonify({"success": True, "key": key})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-@app.route("/api/stats")
-def api_stats():
-    try:
-        stats = get_bucket_counts(s3_source, s3_dest)
-        return jsonify({"success": True, "stats": stats})
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
 
 # ============================================================
 # EMBEDDED SINGLE-PAGE WEB EXPLORER (INDEX PAGE)
@@ -397,14 +448,13 @@ INDEX_HTML = """
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>R2 Video Manager & Processor</title>
+  <title>R2 Media & File Manager</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <script src="https://unpkg.com/lucide@latest"></script>
   <style>
     @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
     body { font-family: 'Inter', system-ui, sans-serif; }
     .font-mono { font-family: 'JetBrains Mono', monospace; }
-    /* Toast transition */
     #copyToast { transition: opacity 0.3s ease, transform 0.3s ease; }
   </style>
 </head>
@@ -414,61 +464,88 @@ INDEX_HTML = """
   <header class="sticky top-0 z-40 bg-zinc-900/95 backdrop-blur border-b border-zinc-800 px-4 lg:px-8 py-3 transition-all shadow-sm">
     <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
       
-      <!-- Brand & Main Navigation -->
-      <div class="flex items-center gap-4">
+      <!-- Brand & Navigation Menu Tabs -->
+      <div class="flex items-center gap-4 flex-wrap">
         <div class="flex items-center gap-2.5">
           <div class="h-9 w-9 rounded-lg bg-blue-600/20 border border-blue-500/30 grid place-items-center text-blue-400">
-            <i data-lucide="clapperboard" class="w-5 h-5"></i>
+            <i data-lucide="database" class="w-5 h-5"></i>
           </div>
           <div>
             <h1 class="text-sm font-semibold tracking-tight text-white flex items-center gap-2">
-              R2 Video Manager
-              <span class="text-[10px] font-mono font-normal bg-zinc-800 text-zinc-400 px-2 py-0.5 rounded border border-zinc-700 hidden sm:inline-block">Koyeb Engine</span>
+              R2 Media Manager
+              <span class="text-[10px] font-mono font-normal bg-emerald-950 text-emerald-300 px-2 py-0.5 rounded border border-emerald-800">SQLite Engine</span>
             </h1>
             <p class="text-[11px] text-zinc-400 font-mono">Source: {{ source_bucket }} | Dest: {{ dest_bucket }}</p>
           </div>
         </div>
 
-        <!-- Navigation Tabs Menu -->
-        <div class="flex items-center bg-zinc-950 p-1 rounded-xl border border-zinc-800 ml-2">
+        <!-- Navigation Tabs: Explorer, All Images, All Videos, Thumbnails -->
+        <div class="flex items-center bg-zinc-950 p-1 rounded-xl border border-zinc-800 text-xs">
           <button 
-            id="tabSourceBtn" 
-            onclick="switchMainTab('source')" 
-            class="px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 bg-zinc-800 text-white shadow-xs"
+            id="tabBtnExplorer" 
+            onclick="switchTab('explorer')" 
+            class="px-3 py-1.5 rounded-lg font-medium transition-all flex items-center gap-1.5 bg-zinc-800 text-white shadow-xs cursor-pointer"
           >
             <i data-lucide="folder" class="w-3.5 h-3.5 text-blue-400"></i>
-            <span>Source Files</span>
+            <span>Explorer</span>
           </button>
           
           <button 
-            id="tabDestBtn" 
-            onclick="switchMainTab('dest')" 
-            class="px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 text-zinc-400 hover:text-white"
+            id="tabBtnImages" 
+            onclick="switchTab('images')" 
+            class="px-3 py-1.5 rounded-lg font-medium transition-all flex items-center gap-1.5 text-zinc-400 hover:text-white cursor-pointer"
+          >
+            <i data-lucide="image" class="w-3.5 h-3.5 text-emerald-400"></i>
+            <span>All Images</span>
+            <span id="tabImagesCountBadge" class="ml-1 text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-emerald-950/80 text-emerald-300 border border-emerald-800/60">0</span>
+          </button>
+
+          <button 
+            id="tabBtnVideos" 
+            onclick="switchTab('videos')" 
+            class="px-3 py-1.5 rounded-lg font-medium transition-all flex items-center gap-1.5 text-zinc-400 hover:text-white cursor-pointer"
+          >
+            <i data-lucide="film" class="w-3.5 h-3.5 text-rose-400"></i>
+            <span>All Videos</span>
+            <span id="tabVideosCountBadge" class="ml-1 text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-rose-950/80 text-rose-300 border border-rose-800/60">0</span>
+          </button>
+
+          <button 
+            id="tabBtnThumbnails" 
+            onclick="switchTab('thumbnails')" 
+            class="px-3 py-1.5 rounded-lg font-medium transition-all flex items-center gap-1.5 text-zinc-400 hover:text-white cursor-pointer"
           >
             <i data-lucide="sparkles" class="w-3.5 h-3.5 text-amber-400"></i>
-            <span>Destination Thumbnails</span>
-            <span id="tabDestCountBadge" class="ml-1 text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-amber-950/80 text-amber-300 border border-amber-800/60">0</span>
+            <span>Thumbnails</span>
+            <span id="tabThumbsCountBadge" class="ml-1 text-[10px] font-mono px-1.5 py-0.2 rounded-full bg-amber-950/80 text-amber-300 border border-amber-800/60">0</span>
           </button>
         </div>
       </div>
 
-      <!-- Header Action Buttons -->
+      <!-- Action Buttons (Sync, Tasks) -->
       <div class="flex items-center gap-2">
+        <!-- Manual Rescan R2 Button -->
+        <button 
+          id="btnRescan" 
+          onclick="triggerRescan()" 
+          class="px-3 py-1.5 rounded-lg border border-zinc-700 bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-zinc-200 flex items-center gap-1.5 transition-colors cursor-pointer"
+          title="Rescan R2 buckets and update SQLite database"
+        >
+          <i data-lucide="refresh-cw" class="w-3.5 h-3.5 text-blue-400" id="syncSpinIcon"></i>
+          <span id="syncBtnText">Rescan R2</span>
+        </button>
+
         <button onclick="openTaskModal()" class="px-3 py-1.5 rounded-lg border border-zinc-700 bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-zinc-200 flex items-center gap-1.5 transition-colors cursor-pointer">
           <i data-lucide="activity" class="w-3.5 h-3.5 text-emerald-400"></i>
           <span>Tasks</span>
           <span id="taskStatusDot" class="w-2 h-2 rounded-full bg-zinc-500 inline-block"></span>
-        </button>
-
-        <button onclick="refreshActiveTab()" class="p-2 rounded-lg border border-zinc-700 bg-zinc-800 hover:bg-zinc-700 text-zinc-300 transition-colors cursor-pointer" title="Refresh Current View">
-          <i data-lucide="rotate-cw" class="w-4 h-4" id="refreshIcon"></i>
         </button>
       </div>
 
     </div>
   </header>
 
-  <!-- FLOATING SELECTION BAR (For Batch Operations) -->
+  <!-- BATCH SELECTION BAR -->
   <div id="selectionHeader" class="hidden sticky top-14 z-30 bg-blue-950/95 border-b border-blue-800/80 px-4 lg:px-8 py-2.5 shadow-lg backdrop-blur">
     <div class="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-3">
       <div class="flex items-center gap-2.5">
@@ -478,14 +555,12 @@ INDEX_HTML = """
       </div>
 
       <div class="flex items-center gap-2">
-        <!-- DOWNLOAD & PROCESS BUTTON -->
-        <button onclick="triggerProcessSelected()" class="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1.5 shadow transition-all cursor-pointer">
+        <button id="batchProcessBtn" onclick="triggerProcessSelected()" class="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1.5 shadow transition-all cursor-pointer">
           <i data-lucide="download-cloud" class="w-3.5 h-3.5"></i>
           <span>Download & Process</span>
         </button>
 
-        <!-- DELETE BUTTON -->
-        <button onclick="openDeleteModal()" class="px-3 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-semibold flex items-center gap-1.5 shadow transition-all cursor-pointer">
+        <button onclick="openDeleteModal()" class="px-3.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-white text-xs font-semibold flex items-center gap-1.5 shadow transition-all cursor-pointer">
           <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
           <span>Delete from R2</span>
         </button>
@@ -493,35 +568,35 @@ INDEX_HTML = """
     </div>
   </div>
 
-  <!-- MAIN BODY CONTAINER -->
+  <!-- MAIN BODY -->
   <main class="flex-1 max-w-7xl w-full mx-auto p-4 lg:p-8 space-y-5">
 
     <!-- SUMMARY STATS: CHOTE CHOTE CARDS -->
     <div class="grid grid-cols-1 sm:grid-cols-3 gap-3.5">
       
-      <!-- Card 1: R2 Videos -->
+      <!-- Card 1: R2 Videos (Click shows all videos) -->
       <div 
-        onclick="applyTypeFilter('video')" 
-        class="bg-zinc-900 border border-zinc-800 hover:border-blue-500/50 rounded-xl p-3.5 flex items-center justify-between shadow-xs cursor-pointer transition-all hover:bg-zinc-900/80 group"
+        onclick="switchTab('videos')" 
+        class="bg-zinc-900 border border-zinc-800 hover:border-rose-500/50 rounded-xl p-3.5 flex items-center justify-between shadow-xs cursor-pointer transition-all hover:bg-zinc-900/80 group"
       >
         <div class="flex items-center gap-3">
-          <div class="h-10 w-10 rounded-xl bg-blue-950/60 border border-blue-800/60 text-blue-400 grid place-items-center group-hover:scale-105 transition-transform">
+          <div class="h-10 w-10 rounded-xl bg-rose-950/60 border border-rose-800/60 text-rose-400 grid place-items-center group-hover:scale-105 transition-transform">
             <i data-lucide="film" class="w-5 h-5"></i>
           </div>
           <div>
             <div class="text-[11px] font-medium text-zinc-400 uppercase tracking-wider">R2 Videos</div>
             <div id="statVideosCount" class="text-lg font-bold text-white font-mono leading-tight">--</div>
-            <div class="text-[10px] text-zinc-500">Source Bucket Videos</div>
+            <div class="text-[10px] text-zinc-500">Click to view all videos</div>
           </div>
         </div>
         <div class="text-right">
-          <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-blue-950/80 text-blue-300 border border-blue-800/60">Filter</span>
+          <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-rose-950/80 text-rose-300 border border-rose-800/60">View All &rarr;</span>
         </div>
       </div>
 
-      <!-- Card 2: R2 Images -->
+      <!-- Card 2: R2 Images (Click shows ALL IMAGES across ALL folders flat!) -->
       <div 
-        onclick="applyTypeFilter('image')" 
+        onclick="switchTab('images')" 
         class="bg-zinc-900 border border-zinc-800 hover:border-emerald-500/50 rounded-xl p-3.5 flex items-center justify-between shadow-xs cursor-pointer transition-all hover:bg-zinc-900/80 group"
       >
         <div class="flex items-center gap-3">
@@ -531,17 +606,17 @@ INDEX_HTML = """
           <div>
             <div class="text-[11px] font-medium text-zinc-400 uppercase tracking-wider">R2 Images</div>
             <div id="statImagesCount" class="text-lg font-bold text-white font-mono leading-tight">--</div>
-            <div class="text-[10px] text-zinc-500">Source Bucket Images</div>
+            <div class="text-[10px] text-zinc-500">Click to view all images (Flat)</div>
           </div>
         </div>
         <div class="text-right">
-          <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-800/60">Filter</span>
+          <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-emerald-950/80 text-emerald-300 border border-emerald-800/60">View All &rarr;</span>
         </div>
       </div>
 
       <!-- Card 3: Thumbnails (Destination) -->
       <div 
-        onclick="switchMainTab('dest')" 
+        onclick="switchTab('thumbnails')" 
         class="bg-zinc-900 border border-zinc-800 hover:border-amber-500/50 rounded-xl p-3.5 flex items-center justify-between shadow-xs cursor-pointer transition-all hover:bg-zinc-900/80 group"
       >
         <div class="flex items-center gap-3">
@@ -551,7 +626,7 @@ INDEX_HTML = """
           <div>
             <div class="text-[11px] font-medium text-zinc-400 uppercase tracking-wider">Thumbnails</div>
             <div id="statThumbsCount" class="text-lg font-bold text-white font-mono leading-tight">--</div>
-            <div class="text-[10px] text-zinc-500">new_thumbnails/ Folder</div>
+            <div class="text-[10px] text-zinc-500">Destination R2 new_thumbnails/</div>
           </div>
         </div>
         <div class="text-right">
@@ -562,110 +637,153 @@ INDEX_HTML = """
     </div>
 
     <!-- ============================================================ -->
-    <!-- SECTION 1: SOURCE R2 FILES EXPLORER -->
+    <!-- VIEW 1: ALL IMAGES (FLAT ACROSS ALL FOLDERS) -->
     <!-- ============================================================ -->
-    <div id="sectionSource" class="space-y-4">
-      
-      <!-- TOOLBAR: BREADCRUMBS, SEARCH, TYPE FILTERS & VIEW MODE -->
+    <div id="viewImages" class="hidden space-y-4">
       <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-3 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 shadow-xs">
-        
-        <!-- Breadcrumb navigation -->
+        <div class="flex items-center gap-2 text-xs">
+          <i data-lucide="image" class="w-4 h-4 text-emerald-400"></i>
+          <span class="font-semibold text-white">All Source Images</span>
+          <span class="text-zinc-500 font-mono text-[11px]" id="imagesHeaderSubtext">(Flat view across all folders)</span>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <!-- Select All Images Checkbox -->
+          <button onclick="toggleSelectAllImages()" class="px-2.5 py-1.5 rounded-lg border border-zinc-700 bg-zinc-950 hover:bg-zinc-800 text-[11px] text-zinc-300 cursor-pointer">
+            Select All
+          </button>
+
+          <div class="relative min-w-[240px]">
+            <i data-lucide="search" class="w-3.5 h-3.5 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2"></i>
+            <input 
+              type="text" 
+              id="allImagesSearch" 
+              placeholder="Search images by name..." 
+              oninput="filterAllImages()" 
+              class="w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-zinc-600"
+            >
+          </div>
+        </div>
+      </div>
+
+      <!-- Images Grid Container -->
+      <div id="allImagesGrid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+        <!-- Rendered dynamically -->
+      </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- VIEW 2: ALL VIDEOS (FLAT ACROSS ALL FOLDERS) -->
+    <!-- ============================================================ -->
+    <div id="viewVideos" class="hidden space-y-4">
+      <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-3 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 shadow-xs">
+        <div class="flex items-center gap-2 text-xs">
+          <i data-lucide="film" class="w-4 h-4 text-rose-400"></i>
+          <span class="font-semibold text-white">All Source Videos</span>
+          <span class="text-zinc-500 font-mono text-[11px]">(All folders combined)</span>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <button onclick="toggleSelectAllVideos()" class="px-2.5 py-1.5 rounded-lg border border-zinc-700 bg-zinc-950 hover:bg-zinc-800 text-[11px] text-zinc-300 cursor-pointer">
+            Select All
+          </button>
+
+          <div class="relative min-w-[240px]">
+            <i data-lucide="search" class="w-3.5 h-3.5 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2"></i>
+            <input 
+              type="text" 
+              id="allVideosSearch" 
+              placeholder="Search videos by name..." 
+              oninput="filterAllVideos()" 
+              class="w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-zinc-600"
+            >
+          </div>
+        </div>
+      </div>
+
+      <!-- Videos Grid Container -->
+      <div id="allVideosGrid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+        <!-- Rendered dynamically -->
+      </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- VIEW 3: EXPLORER VIEW (HIERARCHY SUBFOLDERS & FILES) -->
+    <!-- ============================================================ -->
+    <div id="viewExplorer" class="space-y-4">
+      
+      <!-- Toolbar: Breadcrumbs, Search & Layout Switcher -->
+      <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-3 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 shadow-xs">
         <nav id="breadcrumbs" class="flex items-center gap-1 text-xs text-zinc-400 overflow-x-auto whitespace-nowrap py-1">
           <!-- Populated dynamically -->
         </nav>
 
-        <!-- Right Controls: Type Filter, Search & Layout View Switcher -->
-        <div class="flex flex-wrap items-center gap-2">
-          
-          <!-- Filter buttons: All, Videos, Images -->
-          <div class="flex items-center bg-zinc-950 p-1 rounded-lg border border-zinc-800 text-[11px]">
-            <button onclick="applyTypeFilter('all')" id="filterBtnAll" class="px-2.5 py-1 rounded-md font-medium text-white bg-zinc-800">All</button>
-            <button onclick="applyTypeFilter('video')" id="filterBtnVideo" class="px-2.5 py-1 rounded-md font-medium text-zinc-400 hover:text-white">Videos</button>
-            <button onclick="applyTypeFilter('image')" id="filterBtnImage" class="px-2.5 py-1 rounded-md font-medium text-zinc-400 hover:text-white">Images</button>
-          </div>
-
-          <!-- Search input -->
+        <div class="flex items-center gap-2">
           <div class="relative min-w-[200px] flex-1 sm:flex-initial">
             <i data-lucide="search" class="w-3.5 h-3.5 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2"></i>
             <input 
               type="text" 
-              id="searchFilter" 
+              id="explorerSearch" 
               placeholder="Search current folder..." 
-              oninput="renderSourceView()" 
+              oninput="renderExplorerView()" 
               class="w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-zinc-600"
             >
           </div>
 
-          <!-- View Switcher (Grid Cards vs Table) -->
           <div class="flex items-center bg-zinc-950 p-1 rounded-lg border border-zinc-800">
-            <button onclick="setViewMode('cards')" id="viewModeCardsBtn" class="p-1.5 rounded-md text-white bg-zinc-800" title="Grid / Small Cards View">
+            <button onclick="setExplorerLayout('cards')" id="layoutCardsBtn" class="p-1.5 rounded-md text-white bg-zinc-800 cursor-pointer" title="Cards View">
               <i data-lucide="layout-grid" class="w-3.5 h-3.5"></i>
             </button>
-            <button onclick="setViewMode('table')" id="viewModeTableBtn" class="p-1.5 rounded-md text-zinc-400 hover:text-white" title="Table View">
+            <button onclick="setExplorerLayout('table')" id="layoutTableBtn" class="p-1.5 rounded-md text-zinc-400 hover:text-white cursor-pointer" title="Table View">
               <i data-lucide="list" class="w-3.5 h-3.5"></i>
             </button>
           </div>
-
         </div>
       </div>
 
-      <!-- CONTAINER: DYNAMIC SOURCE FILES VIEW -->
-      <div id="sourceViewContainer">
-        <!-- Renders Cards or Table via JavaScript -->
-        <div class="p-12 text-center text-zinc-500 text-xs bg-zinc-900 border border-zinc-800 rounded-xl">Loading directory...</div>
+      <div id="explorerContainer">
+        <!-- Dynamic folders and files -->
       </div>
 
     </div>
 
     <!-- ============================================================ -->
-    <!-- SECTION 2: DESTINATION THUMBNAILS GALLERY (NEW MENU) -->
+    <!-- VIEW 4: DESTINATION THUMBNAILS GALLERY -->
     <!-- ============================================================ -->
-    <div id="sectionDest" class="hidden space-y-4">
-      
-      <!-- Thumbnails Bar: Search & Info -->
+    <div id="viewThumbnails" class="hidden space-y-4">
       <div class="bg-zinc-900 border border-zinc-800 rounded-xl p-3 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3 shadow-xs">
         <div class="flex items-center gap-2 text-xs">
           <i data-lucide="sparkles" class="w-4 h-4 text-amber-400"></i>
           <span class="font-semibold text-white">Destination R2 Thumbnails</span>
-          <span class="text-zinc-500 font-mono text-[11px]">(Prefix: new_thumbnails/)</span>
+          <span class="text-zinc-500 font-mono text-[11px]">(new_thumbnails/ folder)</span>
         </div>
 
         <div class="flex items-center gap-2">
-          <!-- Search input for thumbnails -->
           <div class="relative min-w-[240px]">
             <i data-lucide="search" class="w-3.5 h-3.5 text-zinc-400 absolute left-3 top-1/2 -translate-y-1/2"></i>
             <input 
               type="text" 
-              id="thumbSearchFilter" 
-              placeholder="Search by slug or filename..." 
-              oninput="renderThumbnailsView()" 
+              id="thumbsSearch" 
+              placeholder="Search thumbnails..." 
+              oninput="filterThumbnails()" 
               class="w-full bg-zinc-950 border border-zinc-800 rounded-lg pl-8 pr-3 py-1.5 text-xs text-white placeholder-zinc-500 focus:outline-none focus:border-zinc-600"
             >
           </div>
-
-          <button onclick="loadThumbnails()" class="px-3 py-1.5 rounded-lg border border-zinc-700 bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-zinc-200 flex items-center gap-1.5 transition-colors cursor-pointer">
-            <i data-lucide="rotate-cw" class="w-3.5 h-3.5"></i>
-            <span>Refresh</span>
-          </button>
         </div>
       </div>
 
-      <!-- Thumbnail Cards Grid -->
-      <div id="thumbnailsContainer" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
-        <div class="col-span-full p-12 text-center text-zinc-500 text-xs bg-zinc-900 border border-zinc-800 rounded-xl">Loading thumbnails...</div>
+      <div id="thumbnailsGrid" class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">
+        <!-- Rendered dynamically -->
       </div>
-
     </div>
 
   </main>
 
   <!-- ============================================================ -->
-  <!-- VIDEO PLAYER MODAL (PLAY ACTION) -->
+  <!-- VIDEO PLAYER MODAL -->
   <!-- ============================================================ -->
   <div id="videoModal" class="hidden fixed inset-0 z-50 overflow-hidden flex items-center justify-center p-4 bg-black/85 backdrop-blur-md">
     <div class="bg-zinc-900 border border-zinc-800 rounded-2xl max-w-4xl w-full p-4 shadow-2xl flex flex-col space-y-3">
-      
-      <!-- Modal Header -->
       <div class="flex items-center justify-between pb-2 border-b border-zinc-800">
         <div class="flex items-center gap-2 truncate">
           <div class="p-1.5 rounded-lg bg-blue-950/80 border border-blue-800/60 text-blue-400">
@@ -673,7 +791,7 @@ INDEX_HTML = """
           </div>
           <div>
             <h3 id="videoModalTitle" class="text-xs font-semibold text-white font-mono truncate max-w-lg">Video Preview</h3>
-            <p id="videoModalSubtitle" class="text-[10px] text-zinc-400 font-mono">Source R2 Stream</p>
+            <p id="videoModalSubtitle" class="text-[10px] text-zinc-400 font-mono">Direct Streaming</p>
           </div>
         </div>
         <button onclick="closeVideoPlayer()" class="text-zinc-400 hover:text-white p-1 rounded-lg hover:bg-zinc-800 transition-colors">
@@ -681,36 +799,27 @@ INDEX_HTML = """
         </button>
       </div>
 
-      <!-- HTML5 Video Player Container -->
       <div class="relative bg-black rounded-xl overflow-hidden aspect-video flex items-center justify-center border border-zinc-800">
-        <video 
-          id="mainVideoPlayer" 
-          controls 
-          autoplay 
-          playsinline 
-          class="w-full h-full object-contain"
-        ></video>
+        <video id="mainVideoPlayer" controls autoplay playsinline class="w-full h-full object-contain"></video>
       </div>
 
-      <!-- Modal Footer Actions -->
       <div class="flex items-center justify-between pt-2">
         <div class="text-[11px] font-mono text-zinc-400 truncate max-w-md" id="videoModalKeyText"></div>
         <div class="flex items-center gap-2">
           <button id="videoModalProcessBtn" onclick="processCurrentPlayingVideo()" class="px-3.5 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-semibold flex items-center gap-1.5 shadow transition-all cursor-pointer">
             <i data-lucide="download-cloud" class="w-3.5 h-3.5"></i>
-            <span>Process This Video</span>
+            <span>Process Video</span>
           </button>
           <button onclick="closeVideoPlayer()" class="px-3.5 py-1.5 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-zinc-300 transition-colors cursor-pointer">
             Close
           </button>
         </div>
       </div>
-
     </div>
   </div>
 
   <!-- ============================================================ -->
-  <!-- IMAGE / THUMBNAIL LIGHTBOX MODAL -->
+  <!-- IMAGE LIGHTBOX MODAL -->
   <!-- ============================================================ -->
   <div id="imageModal" class="hidden fixed inset-0 z-50 overflow-hidden flex items-center justify-center p-4 bg-black/85 backdrop-blur-md" onclick="closeImageModal()">
     <div class="bg-zinc-900 border border-zinc-800 rounded-2xl max-w-4xl w-full p-4 shadow-2xl flex flex-col space-y-3" onclick="event.stopPropagation()">
@@ -729,9 +838,7 @@ INDEX_HTML = """
     </div>
   </div>
 
-  <!-- ============================================================ -->
   <!-- LIVE TASK STATUS MODAL -->
-  <!-- ============================================================ -->
   <div id="taskModal" class="hidden fixed inset-0 z-50 overflow-hidden flex items-center justify-center p-4 bg-black/75 backdrop-blur-xs">
     <div class="bg-zinc-900 border border-zinc-800 rounded-2xl max-w-2xl w-full p-5 shadow-2xl flex flex-col max-h-[85vh]">
       <div class="flex items-center justify-between pb-3 border-b border-zinc-800">
@@ -739,234 +846,69 @@ INDEX_HTML = """
           <i data-lucide="cpu" class="w-4 h-4 text-emerald-400"></i>
           <h3 class="text-sm font-semibold text-white">Video Processing Console</h3>
         </div>
-        <button onclick="closeTaskModal()" class="text-zinc-400 hover:text-white p-1">
-          <i data-lucide="x" class="w-4 h-4"></i>
-        </button>
+        <button onclick="closeTaskModal()" class="text-zinc-400 hover:text-white p-1"><i data-lucide="x" class="w-4 h-4"></i></button>
       </div>
-
       <div class="py-4 space-y-4 flex-1 overflow-y-auto">
-        <div id="taskActiveBanner" class="p-3.5 rounded-xl border border-zinc-800 bg-zinc-950 flex items-center justify-between">
+        <div class="p-3.5 rounded-xl border border-zinc-800 bg-zinc-950 flex items-center justify-between">
           <div>
             <div id="taskStageText" class="text-xs font-semibold text-white">Idle</div>
             <div id="taskKeyText" class="text-[11px] text-zinc-400 font-mono truncate max-w-md mt-0.5">No active task</div>
           </div>
           <div id="taskProgressBadge" class="text-xs font-mono font-semibold px-2 py-1 rounded bg-zinc-800 text-zinc-300">0 / 0</div>
         </div>
-
         <div>
           <span class="text-[10px] uppercase font-semibold text-zinc-500 tracking-wider">Live Processing Console</span>
-          <div id="terminalLogs" class="mt-1.5 p-3 rounded-xl bg-black border border-zinc-800 text-[11px] font-mono text-zinc-300 h-64 overflow-y-auto whitespace-pre-wrap leading-relaxed">
-            Ready.
-          </div>
+          <div id="terminalLogs" class="mt-1.5 p-3 rounded-xl bg-black border border-zinc-800 text-[11px] font-mono text-zinc-300 h-64 overflow-y-auto whitespace-pre-wrap leading-relaxed">Ready.</div>
         </div>
       </div>
-
       <div class="pt-3 border-t border-zinc-800 flex justify-end">
-        <button onclick="closeTaskModal()" class="px-4 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-white transition-colors">
-          Close
-        </button>
+        <button onclick="closeTaskModal()" class="px-4 py-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-xs font-medium text-white transition-colors cursor-pointer">Close</button>
       </div>
     </div>
   </div>
 
-  <!-- ============================================================ -->
   <!-- DELETE CONFIRMATION MODAL -->
-  <!-- ============================================================ -->
   <div id="deleteModal" class="hidden fixed inset-0 z-50 overflow-hidden flex items-center justify-center p-4 bg-black/75 backdrop-blur-xs">
     <div class="bg-zinc-900 border border-zinc-800 rounded-2xl max-w-md w-full p-5 shadow-2xl space-y-4">
       <div class="flex items-center gap-3 text-red-400">
-        <div class="p-2 rounded-lg bg-red-950/60 border border-red-800/80">
-          <i data-lucide="alert-triangle" class="w-5 h-5 text-red-400"></i>
-        </div>
+        <div class="p-2 rounded-lg bg-red-950/60 border border-red-800/80"><i data-lucide="alert-triangle" class="w-5 h-5 text-red-400"></i></div>
         <div>
           <h3 class="text-sm font-semibold text-white">Confirm Permanent Deletion</h3>
-          <p class="text-xs text-zinc-400 mt-0.5">Items will be deleted permanently from R2 storage.</p>
+          <p class="text-xs text-zinc-400 mt-0.5">Items will be deleted from R2 and SQLite.</p>
         </div>
       </div>
-
       <div class="p-3 rounded-xl bg-zinc-950 border border-zinc-800 text-xs text-zinc-300 max-h-40 overflow-y-auto space-y-1 font-mono">
         <div id="deleteSummaryText">Selected items will be deleted permanently.</div>
       </div>
-
       <div class="flex items-center justify-end gap-2 pt-2">
-        <button onclick="closeDeleteModal()" class="px-3.5 py-1.5 rounded-lg border border-zinc-700 text-xs font-medium text-zinc-300 hover:bg-zinc-800">
-          Cancel
-        </button>
-        <button onclick="executeDelete()" class="px-3.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-xs font-semibold text-white shadow">
-          Delete Permanently
-        </button>
+        <button onclick="closeDeleteModal()" class="px-3.5 py-1.5 rounded-lg border border-zinc-700 text-xs font-medium text-zinc-300 hover:bg-zinc-800 cursor-pointer">Cancel</button>
+        <button onclick="executeDelete()" class="px-3.5 py-1.5 rounded-lg bg-red-600 hover:bg-red-500 text-xs font-semibold text-white shadow cursor-pointer">Delete Permanently</button>
       </div>
     </div>
   </div>
 
-  <!-- TOAST NOTIFICATION -->
+  <!-- TOAST -->
   <div id="copyToast" class="fixed bottom-6 right-6 z-50 bg-emerald-600 text-white text-xs font-mono px-4 py-2 rounded-xl shadow-2xl opacity-0 translate-y-3 pointer-events-none flex items-center gap-2">
     <i data-lucide="check" class="w-4 h-4"></i>
-    <span id="copyToastText">Copied to clipboard!</span>
+    <span id="copyToastText">Notification</span>
   </div>
 
-  <!-- ============================================================ -->
-  <!-- FRONTEND JAVASCRIPT APPLICATION LOGIC -->
-  <!-- ============================================================ -->
+  <!-- JAVASCRIPT LOGIC -->
   <script>
-    let activeMainTab = "source"; // 'source' or 'dest'
-    let viewMode = "cards";        // 'cards' or 'table'
-    let typeFilter = "all";        // 'all', 'video', 'image'
+    let activeTab = "explorer"; // 'explorer', 'images', 'videos', 'thumbnails'
+    let explorerLayout = "cards"; // 'cards' or 'table'
     let currentPrefix = "";
-    let directoryData = { folders: [], files: [] };
+
+    // Data stores from SQLite
+    let explorerData = { folders: [], files: [] };
+    let allImagesData = [];
+    let allVideosData = [];
     let thumbnailsData = [];
-    let selectedFolders = new Set();
+
+    // Selected items (Set of keys or folder prefixes)
     let selectedFiles = new Set();
+    let selectedFolders = new Set();
     let currentlyPlayingKey = "";
-
-    // ------------------------------------------------------------
-    // TABS SWITCHING
-    // ------------------------------------------------------------
-    function switchMainTab(tab) {
-      activeMainTab = tab;
-      const secSource = document.getElementById("sectionSource");
-      const secDest = document.getElementById("sectionDest");
-      const btnSource = document.getElementById("tabSourceBtn");
-      const btnDest = document.getElementById("tabDestBtn");
-
-      if (tab === "source") {
-        secSource.classList.remove("hidden");
-        secDest.classList.add("hidden");
-        btnSource.className = "px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 bg-zinc-800 text-white shadow-xs";
-        btnDest.className = "px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 text-zinc-400 hover:text-white";
-        renderSourceView();
-      } else {
-        secSource.classList.add("hidden");
-        secDest.classList.remove("hidden");
-        btnSource.className = "px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 text-zinc-400 hover:text-white";
-        btnDest.className = "px-3 py-1.5 rounded-lg text-xs font-medium transition-all flex items-center gap-1.5 bg-zinc-800 text-white shadow-xs";
-        loadThumbnails();
-      }
-      lucide.createIcons();
-    }
-
-    function refreshActiveTab() {
-      if (activeMainTab === "source") {
-        loadDirectory(currentPrefix);
-      } else {
-        loadThumbnails();
-      }
-      loadBucketStats();
-    }
-
-    // ------------------------------------------------------------
-    // STATS & COUNTERS
-    // ------------------------------------------------------------
-    async function loadBucketStats() {
-      try {
-        const res = await fetch("/api/stats");
-        const json = await res.json();
-        if (json.success && json.stats) {
-          document.getElementById("statVideosCount").innerText = json.stats.videos || 0;
-          document.getElementById("statImagesCount").innerText = json.stats.images || 0;
-          document.getElementById("statThumbsCount").innerText = json.stats.thumbnails || 0;
-          document.getElementById("tabDestCountBadge").innerText = json.stats.thumbnails || 0;
-        }
-      } catch (e) {
-        // silent
-      }
-    }
-
-    // ------------------------------------------------------------
-    // VIEW MODE & TYPE FILTERS
-    // ------------------------------------------------------------
-    function setViewMode(mode) {
-      viewMode = mode;
-      const cardsBtn = document.getElementById("viewModeCardsBtn");
-      const tableBtn = document.getElementById("viewModeTableBtn");
-
-      if (mode === "cards") {
-        cardsBtn.className = "p-1.5 rounded-md text-white bg-zinc-800";
-        tableBtn.className = "p-1.5 rounded-md text-zinc-400 hover:text-white";
-      } else {
-        cardsBtn.className = "p-1.5 rounded-md text-zinc-400 hover:text-white";
-        tableBtn.className = "p-1.5 rounded-md text-white bg-zinc-800";
-      }
-      renderSourceView();
-    }
-
-    function applyTypeFilter(type) {
-      typeFilter = type;
-      if (activeMainTab !== "source") {
-        switchMainTab("source");
-      }
-      const btnAll = document.getElementById("filterBtnAll");
-      const btnVideo = document.getElementById("filterBtnVideo");
-      const btnImage = document.getElementById("filterBtnImage");
-
-      [btnAll, btnVideo, btnImage].forEach(b => {
-        b.className = "px-2.5 py-1 rounded-md font-medium text-zinc-400 hover:text-white";
-      });
-
-      if (type === "all") btnAll.className = "px-2.5 py-1 rounded-md font-medium text-white bg-zinc-800";
-      else if (type === "video") btnVideo.className = "px-2.5 py-1 rounded-md font-medium text-white bg-blue-900/60 text-blue-300";
-      else if (type === "image") btnImage.className = "px-2.5 py-1 rounded-md font-medium text-white bg-emerald-900/60 text-emerald-300";
-
-      renderSourceView();
-    }
-
-    // ------------------------------------------------------------
-    // SOURCE R2 DIRECTORY LOADING
-    // ------------------------------------------------------------
-    async function loadDirectory(prefix = "") {
-      const icon = document.getElementById("refreshIcon");
-      if (icon) icon.classList.add("animate-spin");
-
-      currentPrefix = prefix;
-      selectedFolders.clear();
-      selectedFiles.clear();
-      updateSelectionUI();
-
-      try {
-        const res = await fetch(`/api/files?prefix=${encodeURIComponent(prefix)}`);
-        const json = await res.json();
-        if (json.success) {
-          directoryData = json.data;
-          renderBreadcrumbs();
-          renderSourceView();
-        } else {
-          alert("Error loading directory: " + (json.error || "Unknown"));
-        }
-      } catch (err) {
-        alert("Failed to connect to backend: " + err);
-      } finally {
-        if (icon) icon.classList.remove("animate-spin");
-      }
-    }
-
-    function renderBreadcrumbs() {
-      const container = document.getElementById("breadcrumbs");
-      if (!container) return;
-
-      const parts = currentPrefix.split("/").filter(Boolean);
-      let html = `
-        <button onclick="loadDirectory('')" class="hover:text-white font-medium flex items-center gap-1 transition-colors cursor-pointer">
-          <i data-lucide="home" class="w-3.5 h-3.5"></i>
-          <span>Root</span>
-        </button>
-      `;
-
-      let accumulated = "";
-      parts.forEach((part, index) => {
-        accumulated += part + "/";
-        const targetPrefix = accumulated;
-        const isLast = index === parts.length - 1;
-        html += `<span class="text-zinc-600">/</span>`;
-        if (isLast) {
-          html += `<span class="text-white font-semibold">${part}</span>`;
-        } else {
-          html += `<button onclick="loadDirectory('${targetPrefix}')" class="hover:text-white transition-colors cursor-pointer">${part}</button>`;
-        }
-      });
-
-      container.innerHTML = html;
-      lucide.createIcons();
-    }
 
     function formatBytes(bytes) {
       if (!bytes || bytes === 0) return "0 B";
@@ -977,206 +919,186 @@ INDEX_HTML = """
     }
 
     // ------------------------------------------------------------
-    // RENDER SOURCE FILES (CARDS OR TABLE VIEW WITH FIRST FRAME)
+    // TAB NAVIGATION
     // ------------------------------------------------------------
-    function renderSourceView() {
-      const container = document.getElementById("sourceViewContainer");
-      const search = (document.getElementById("searchFilter")?.value || "").toLowerCase().trim();
+    function switchTab(tab) {
+      activeTab = tab;
+      selectedFiles.clear();
+      selectedFolders.clear();
+      updateSelectionUI();
 
-      let folders = directoryData.folders || [];
-      let files = directoryData.files || [];
+      const tabs = ["explorer", "images", "videos", "thumbnails"];
+      tabs.forEach(t => {
+        const viewEl = document.getElementById(`view${t.charAt(0).toUpperCase() + t.slice(1)}`);
+        const btnEl = document.getElementById(`tabBtn${t.charAt(0).toUpperCase() + t.slice(1)}`);
+        if (t === tab) {
+          viewEl?.classList.remove("hidden");
+          btnEl.className = "px-3 py-1.5 rounded-lg font-medium transition-all flex items-center gap-1.5 bg-zinc-800 text-white shadow-xs cursor-pointer";
+        } else {
+          viewEl?.classList.add("hidden");
+          btnEl.className = "px-3 py-1.5 rounded-lg font-medium transition-all flex items-center gap-1.5 text-zinc-400 hover:text-white cursor-pointer";
+        }
+      });
 
-      // Update top counter cards immediately from directory files
-      const allFiles = directoryData.files || [];
-      const currentVideos = allFiles.filter(f => f.is_video).length;
-      const currentImages = allFiles.filter(f => f.is_image).length;
-      const statVid = document.getElementById("statVideosCount");
-      const statImg = document.getElementById("statImagesCount");
-      if (statVid) statVid.innerText = currentVideos;
-      if (statImg) statImg.innerText = currentImages;
+      if (tab === "explorer") loadExplorer(currentPrefix);
+      else if (tab === "images") loadAllImages();
+      else if (tab === "videos") loadAllVideos();
+      else if (tab === "thumbnails") loadThumbnails();
 
-      // Apply search filter
+      lucide.createIcons();
+    }
+
+    // ------------------------------------------------------------
+    // STATS & BACKGROUND RESCAN
+    // ------------------------------------------------------------
+    async function loadStats() {
+      try {
+        const res = await fetch("/api/stats");
+        const json = await res.json();
+        if (json.success && json.stats) {
+          const s = json.stats;
+          document.getElementById("statVideosCount").innerText = s.videos;
+          document.getElementById("statImagesCount").innerText = s.images;
+          document.getElementById("statThumbsCount").innerText = s.thumbnails;
+          document.getElementById("tabVideosCountBadge").innerText = s.videos;
+          document.getElementById("tabImagesCountBadge").innerText = s.images;
+          document.getElementById("tabThumbsCountBadge").innerText = s.thumbnails;
+
+          const spinIcon = document.getElementById("syncSpinIcon");
+          const syncText = document.getElementById("syncBtnText");
+          if (s.is_syncing) {
+            spinIcon.classList.add("animate-spin");
+            syncText.innerText = "Syncing R2...";
+          } else {
+            spinIcon.classList.remove("animate-spin");
+            syncText.innerText = "Rescan R2";
+          }
+        }
+      } catch (e) {}
+    }
+
+    async function triggerRescan() {
+      try {
+        const btn = document.getElementById("btnRescan");
+        document.getElementById("syncSpinIcon").classList.add("animate-spin");
+        document.getElementById("syncBtnText").innerText = "Scanning...";
+        const res = await fetch("/api/sync", { method: "POST" });
+        const json = await res.json();
+        showToast("R2 Scan started in background!");
+        
+        let pollCount = 0;
+        const interval = setInterval(async () => {
+          await loadStats();
+          pollCount++;
+          if (pollCount > 20) clearInterval(interval);
+        }, 1500);
+      } catch (e) {
+        alert("Rescan error: " + e);
+      }
+    }
+
+    // ------------------------------------------------------------
+    // 1. ALL IMAGES (FLAT ACROSS ALL FOLDERS)
+    // ------------------------------------------------------------
+    async function loadAllImages() {
+      const container = document.getElementById("allImagesGrid");
+      container.innerHTML = `<div class="col-span-full p-12 text-center text-zinc-500 text-xs">Loading images from SQLite...</div>`;
+
+      try {
+        const res = await fetch("/api/images");
+        const json = await res.json();
+        if (json.success) {
+          allImagesData = json.images || [];
+          renderAllImagesView();
+        } else {
+          container.innerHTML = `<div class="col-span-full p-8 text-center text-red-400 text-xs">${json.error}</div>`;
+        }
+      } catch (e) {
+        container.innerHTML = `<div class="col-span-full p-8 text-center text-red-400 text-xs">Error: ${e}</div>`;
+      }
+    }
+
+    function filterAllImages() {
+      renderAllImagesView();
+    }
+
+    function renderAllImagesView() {
+      const container = document.getElementById("allImagesGrid");
+      const search = (document.getElementById("allImagesSearch")?.value || "").toLowerCase().trim();
+      let filtered = allImagesData;
       if (search) {
-        folders = folders.filter(f => f.name.toLowerCase().includes(search));
-        files = files.filter(f => f.name.toLowerCase().includes(search));
+        filtered = filtered.filter(img => img.name.toLowerCase().includes(search) || img.key.toLowerCase().includes(search));
       }
 
-      // Apply type filter
-      if (typeFilter === "video") {
-        folders = [];
-        files = files.filter(f => f.is_video);
-      } else if (typeFilter === "image") {
-        folders = [];
-        files = files.filter(f => f.is_image);
-      }
+      const subtext = document.getElementById("imagesHeaderSubtext");
+      if (subtext) subtext.innerText = `(${filtered.length} images found across all folders)`;
 
-      if (folders.length === 0 && files.length === 0) {
+      if (filtered.length === 0) {
         container.innerHTML = `
-          <div class="p-14 text-center text-zinc-500 text-xs bg-zinc-900 border border-zinc-800 rounded-xl space-y-2">
-            <i data-lucide="inbox" class="w-8 h-8 mx-auto text-zinc-600"></i>
-            <div>No matching files or folders found in this directory.</div>
+          <div class="col-span-full p-14 text-center text-zinc-500 text-xs bg-zinc-900 border border-zinc-800 rounded-xl space-y-2">
+            <i data-lucide="image" class="w-8 h-8 mx-auto text-zinc-600"></i>
+            <div>No images found. Click 'Rescan R2' to index items from your bucket!</div>
           </div>
         `;
         lucide.createIcons();
         return;
       }
 
-      if (viewMode === "cards") {
-        renderCardsView(container, folders, files);
-      } else {
-        renderTableView(container, folders, files);
-      }
-
-      lucide.createIcons();
-    }
-
-    // ------------------------------------------------------------
-    // 1. CARDS / GRID VIEW (CHOTE CHOTE CARDS WITH FIRST FRAME)
-    // ------------------------------------------------------------
-    function renderCardsView(container, folders, files) {
-      let html = `<div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">`;
-
-      // Folder Cards
-      folders.forEach(folder => {
-        const isSelected = selectedFolders.has(folder.prefix);
-        html += `
-          <div class="bg-zinc-900 border ${isSelected ? 'border-blue-500 bg-blue-950/20' : 'border-zinc-800'} rounded-xl p-3 flex flex-col justify-between hover:border-zinc-700 transition-all shadow-xs group">
-            <div class="flex items-start justify-between gap-2">
-              <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelectFolder('${folder.prefix}', this.checked)" class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer mt-1">
-              <div onclick="loadDirectory('${folder.prefix}')" class="flex-1 cursor-pointer">
-                <div class="h-20 rounded-lg bg-zinc-950 border border-zinc-800/80 flex flex-col items-center justify-center text-amber-400 group-hover:scale-102 transition-transform">
-                  <i data-lucide="folder" class="w-8 h-8 fill-amber-400/20"></i>
-                  <span class="text-[10px] text-zinc-500 mt-1 uppercase font-mono font-medium tracking-wider">Subfolder</span>
-                </div>
-                <div class="mt-2.5">
-                  <h4 class="text-xs font-semibold text-white group-hover:underline truncate" title="${folder.name}">${folder.name}</h4>
-                </div>
-              </div>
-            </div>
-
-            <div class="mt-3 pt-2.5 border-t border-zinc-800/80 flex items-center justify-between">
-              <span class="text-[10px] font-mono text-zinc-500">Folder</span>
-              <button onclick="triggerProcessFolder('${folder.prefix}')" class="px-2 py-1 rounded bg-zinc-800 hover:bg-emerald-600 hover:text-white text-[11px] text-zinc-300 font-medium transition-colors cursor-pointer" title="Process all videos in folder">
-                Process
-              </button>
-            </div>
-          </div>
-        `;
-      });
-
-      // File Cards (Videos & Images)
-      files.forEach(file => {
-        const isSelected = selectedFiles.has(file.key);
-        const streamUrl = `/api/media/stream?target=source&key=${encodeURIComponent(file.key)}`;
-        const directUrl = file.url || streamUrl;
-        const safeName = file.name.replace(/'/g, "\\\\'");
-        const safeKey = file.key.replace(/'/g, "\\\\'");
-        const safeUrl = directUrl.replace(/'/g, "\\\\'");
+      let html = "";
+      filtered.forEach(img => {
+        const isSelected = selectedFiles.has(img.key);
+        const safeKey = img.key.replace(/'/g, "\\\\'");
+        const safeName = img.name.replace(/'/g, "\\\\'");
+        const directUrl = img.direct_url;
+        const streamUrl = img.stream_url;
 
         html += `
-          <div class="bg-zinc-900 border ${isSelected ? 'border-blue-500 bg-blue-950/20' : 'border-zinc-800'} rounded-xl overflow-hidden flex flex-col justify-between hover:border-zinc-700 transition-all shadow-xs group">
+          <div class="bg-zinc-900 border ${isSelected ? 'border-emerald-500 bg-emerald-950/20' : 'border-zinc-800'} rounded-xl overflow-hidden flex flex-col justify-between hover:border-zinc-700 transition-all shadow-xs group">
             
-            <!-- Thumbnail / First Frame Preview Box -->
             <div class="relative w-full aspect-video bg-black overflow-hidden border-b border-zinc-800/80">
-              
-              ${file.is_video ? `
-                <!-- Video First Frame using direct presigned URL with onloadedmetadata -->
-                <video 
-                  src="${directUrl}#t=0.5" 
-                  preload="metadata" 
-                  muted 
-                  playsinline 
-                  onloadedmetadata="try{if(this.currentTime===0)this.currentTime=0.5;}catch(e){}"
-                  onerror="if(!this.dataset.retry){this.dataset.retry='1';this.src='${streamUrl}#t=0.5';}"
-                  class="w-full h-full object-cover"
-                ></video>
+              <img 
+                src="${directUrl}" 
+                loading="lazy" 
+                alt="${img.name}" 
+                onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${directUrl}')"
+                onerror="if(!this.dataset.retry){this.dataset.retry='1';this.src='${streamUrl}';}"
+                class="w-full h-full object-cover cursor-pointer hover:scale-105 transition-transform"
+              >
 
-                <!-- Hover Play Overlay Icon -->
-                <div 
-                  onclick="openVideoPlayer('${safeKey}', '${safeName}', '${safeUrl}')" 
-                  class="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity cursor-pointer"
-                  title="Play video"
-                >
-                  <div class="w-10 h-10 rounded-full bg-blue-600/90 text-white flex items-center justify-center shadow-lg hover:scale-110 transition-transform">
-                    <i data-lucide="play" class="w-4 h-4 fill-white ml-0.5"></i>
-                  </div>
-                </div>
-
-                <!-- Video Badge -->
-                <span class="absolute top-2 right-2 text-[9.5px] font-mono font-semibold px-1.5 py-0.5 rounded bg-rose-950/90 text-rose-300 border border-rose-800/60 shadow">
-                  ${file.ext.toUpperCase()}
-                </span>
-              ` : file.is_image ? `
-                <!-- Image Preview with direct presigned URL and fallback -->
-                <img 
-                  src="${directUrl}" 
-                  loading="lazy" 
-                  alt="${file.name}" 
-                  onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${safeUrl}')"
-                  onerror="if(!this.dataset.retry){this.dataset.retry='1';this.src='${streamUrl}';}"
-                  class="w-full h-full object-cover cursor-pointer hover:scale-105 transition-transform"
-                >
-                <span class="absolute top-2 right-2 text-[9.5px] font-mono font-semibold px-1.5 py-0.5 rounded bg-blue-950/90 text-blue-300 border border-blue-800/60 shadow">
-                  ${file.ext.toUpperCase()}
-                </span>
-              ` : `
-                <!-- Generic File -->
-                <div class="w-full h-full flex flex-col items-center justify-center text-zinc-500">
-                  <i data-lucide="file" class="w-8 h-8"></i>
-                  <span class="text-[10px] font-mono mt-1">${file.ext.toUpperCase()}</span>
-                </div>
-              `}
-
-              <!-- Checkbox (Top Left) -->
               <div class="absolute top-2 left-2 z-10 bg-zinc-950/70 p-1 rounded backdrop-blur">
                 <input 
                   type="checkbox" 
                   ${isSelected ? 'checked' : ''} 
-                  onchange="toggleSelectFile('${file.key}', this.checked)" 
-                  class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer block"
+                  onchange="toggleSelectFile('${img.key}', this.checked)" 
+                  class="rounded bg-zinc-800 border-zinc-700 text-emerald-500 focus:ring-0 cursor-pointer block"
                 >
               </div>
 
+              ${img.folder ? `
+                <span class="absolute bottom-2 left-2 text-[9px] font-mono px-1.5 py-0.5 rounded bg-black/80 text-zinc-400 border border-zinc-800 truncate max-w-[85%] backdrop-blur" title="${img.folder}">
+                  📁 ${img.folder}
+                </span>
+              ` : `
+                <span class="absolute bottom-2 left-2 text-[9px] font-mono px-1.5 py-0.5 rounded bg-black/80 text-zinc-500 border border-zinc-800 backdrop-blur">Root</span>
+              `}
             </div>
 
-            <!-- Card Body Details -->
-            <div class="p-3 space-y-2">
-              <h4 class="text-xs font-semibold text-white font-mono truncate" title="${file.name}">${file.name}</h4>
+            <div class="p-3 space-y-1">
+              <h4 class="text-xs font-semibold text-white font-mono truncate" title="${img.name}">${img.name}</h4>
               <div class="flex items-center justify-between text-[10px] font-mono text-zinc-400">
-                <span>${formatBytes(file.size)}</span>
-                <span>${file.last_modified}</span>
+                <span>${formatBytes(img.size)}</span>
+                <span>${img.last_modified}</span>
               </div>
             </div>
 
-            <!-- Card Actions -->
             <div class="px-3 pb-3 pt-1 border-t border-zinc-800/80 flex items-center justify-between gap-1.5">
-              ${file.is_video ? `
-                <button 
-                  onclick="openVideoPlayer('${safeKey}', '${safeName}', '${safeUrl}')" 
-                  class="flex-1 py-1 px-2 rounded-lg bg-blue-950/60 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-800/60 text-[11px] font-semibold flex items-center justify-center gap-1 transition-all cursor-pointer"
-                  title="Play Video"
-                >
-                  <i data-lucide="play" class="w-3 h-3 fill-current"></i>
-                  <span>Play</span>
-                </button>
-
-                <button 
-                  onclick="triggerProcessSingle('${safeKey}')" 
-                  class="flex-1 py-1 px-2 rounded-lg bg-emerald-950/60 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-800/60 text-[11px] font-semibold flex items-center justify-center gap-1 transition-all cursor-pointer"
-                  title="Download, Make Composite Thumbnail & Upload"
-                >
-                  <i data-lucide="download-cloud" class="w-3 h-3"></i>
-                  <span>Process</span>
-                </button>
-              ` : file.is_image ? `
-                <button 
-                  onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${safeUrl}')" 
-                  class="flex-1 py-1 px-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white text-[11px] font-medium flex items-center justify-center gap-1 transition-all cursor-pointer"
-                >
-                  <i data-lucide="maximize-2" class="w-3 h-3"></i>
-                  <span>View</span>
-                </button>
-              ` : ''}
+              <button 
+                onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${directUrl}')" 
+                class="flex-1 py-1 px-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white text-[11px] font-medium flex items-center justify-center gap-1 transition-all cursor-pointer"
+              >
+                <i data-lucide="maximize-2" class="w-3 h-3"></i>
+                <span>View</span>
+              </button>
 
               <button 
                 onclick="triggerDeleteSingle('${safeKey}')" 
@@ -1191,75 +1113,299 @@ INDEX_HTML = """
         `;
       });
 
-      html += `</div>`;
       container.innerHTML = html;
+      lucide.createIcons();
+    }
+
+    function toggleSelectAllImages() {
+      const allSelected = allImagesData.every(img => selectedFiles.has(img.key));
+      if (allSelected) {
+        selectedFiles.clear();
+      } else {
+        allImagesData.forEach(img => selectedFiles.add(img.key));
+      }
+      renderAllImagesView();
+      updateSelectionUI();
     }
 
     // ------------------------------------------------------------
-    // 2. TABLE VIEW (WITH VIDEO FIRST FRAME IN COLUMN)
+    // 2. ALL VIDEOS (FLAT ACROSS ALL FOLDERS)
     // ------------------------------------------------------------
-    function renderTableView(container, folders, files) {
-      let html = `
-        <div class="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden shadow-xs">
-          <!-- Table Header -->
-          <div class="bg-zinc-950/80 border-b border-zinc-800 px-4 py-3 flex items-center justify-between text-xs font-medium text-zinc-400 uppercase tracking-wider text-[11px]">
-            <div class="flex items-center gap-3">
-              <input type="checkbox" id="selectAllCheckbox" onchange="toggleSelectAll(this.checked)" class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer">
-              <span>Item</span>
-            </div>
-            <div class="flex items-center gap-8">
-              <span class="hidden sm:inline w-20 text-right">Size</span>
-              <span class="hidden md:inline w-32 text-right">Last Modified</span>
-              <span class="w-36 text-right">Actions</span>
-            </div>
-          </div>
-          <div class="divide-y divide-zinc-800/60 text-xs">
-      `;
+    async function loadAllVideos() {
+      const container = document.getElementById("allVideosGrid");
+      container.innerHTML = `<div class="col-span-full p-12 text-center text-zinc-500 text-xs">Loading videos from SQLite...</div>`;
 
-      // Render Folders
-      folders.forEach(folder => {
-        const isSelected = selectedFolders.has(folder.prefix);
+      try {
+        const res = await fetch("/api/videos");
+        const json = await res.json();
+        if (json.success) {
+          allVideosData = json.videos || [];
+          renderAllVideosView();
+        } else {
+          container.innerHTML = `<div class="col-span-full p-8 text-center text-red-400 text-xs">${json.error}</div>`;
+        }
+      } catch (e) {
+        container.innerHTML = `<div class="col-span-full p-8 text-center text-red-400 text-xs">Error: ${e}</div>`;
+      }
+    }
+
+    function filterAllVideos() {
+      renderAllVideosView();
+    }
+
+    function renderAllVideosView() {
+      const container = document.getElementById("allVideosGrid");
+      const search = (document.getElementById("allVideosSearch")?.value || "").toLowerCase().trim();
+      let filtered = allVideosData;
+      if (search) {
+        filtered = filtered.filter(v => v.name.toLowerCase().includes(search) || v.key.toLowerCase().includes(search));
+      }
+
+      if (filtered.length === 0) {
+        container.innerHTML = `
+          <div class="col-span-full p-14 text-center text-zinc-500 text-xs bg-zinc-900 border border-zinc-800 rounded-xl space-y-2">
+            <i data-lucide="film" class="w-8 h-8 mx-auto text-zinc-600"></i>
+            <div>No videos found.</div>
+          </div>
+        `;
+        lucide.createIcons();
+        return;
+      }
+
+      let html = "";
+      filtered.forEach(vid => {
+        const isSelected = selectedFiles.has(vid.key);
+        const safeKey = vid.key.replace(/'/g, "\\\\'");
+        const safeName = vid.name.replace(/'/g, "\\\\'");
+        const directUrl = vid.direct_url;
+        const streamUrl = vid.stream_url;
+
         html += `
-          <div class="px-4 py-2.5 flex items-center justify-between hover:bg-zinc-800/40 transition-colors ${isSelected ? 'bg-blue-950/20' : ''}">
-            <div class="flex items-center gap-3 min-w-0">
-              <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelectFolder('${folder.prefix}', this.checked)" class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer">
-              <div onclick="loadDirectory('${folder.prefix}')" class="flex items-center gap-3 cursor-pointer group truncate">
-                <div class="w-12 h-8 rounded bg-zinc-950 border border-zinc-800 flex items-center justify-center text-amber-400 shrink-0">
-                  <i data-lucide="folder" class="w-4 h-4 fill-amber-400/20"></i>
+          <div class="bg-zinc-900 border ${isSelected ? 'border-rose-500 bg-rose-950/20' : 'border-zinc-800'} rounded-xl overflow-hidden flex flex-col justify-between hover:border-zinc-700 transition-all shadow-xs group">
+            
+            <div class="relative w-full aspect-video bg-black overflow-hidden border-b border-zinc-800/80">
+              <video 
+                src="${directUrl}#t=0.5" 
+                preload="metadata" 
+                muted 
+                playsinline 
+                onloadedmetadata="try{if(this.currentTime===0)this.currentTime=0.5;}catch(e){}"
+                onerror="if(!this.dataset.retry){this.dataset.retry='1';this.src='${streamUrl}#t=0.5';}"
+                class="w-full h-full object-cover"
+              ></video>
+
+              <div 
+                onclick="openVideoPlayer('${safeKey}', '${safeName}', '${directUrl}')" 
+                class="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity cursor-pointer"
+                title="Play video"
+              >
+                <div class="w-10 h-10 rounded-full bg-blue-600/90 text-white flex items-center justify-center shadow-lg hover:scale-110 transition-transform">
+                  <i data-lucide="play" class="w-4 h-4 fill-white ml-0.5"></i>
                 </div>
-                <span class="font-medium text-white group-hover:underline truncate">${folder.name}</span>
-                <span class="text-[9.5px] font-mono px-1.5 py-0.2 rounded bg-zinc-800 text-zinc-400 border border-zinc-700">DIR</span>
+              </div>
+
+              <div class="absolute top-2 left-2 z-10 bg-zinc-950/70 p-1 rounded backdrop-blur">
+                <input 
+                  type="checkbox" 
+                  ${isSelected ? 'checked' : ''} 
+                  onchange="toggleSelectFile('${vid.key}', this.checked)" 
+                  class="rounded bg-zinc-800 border-zinc-700 text-rose-500 focus:ring-0 cursor-pointer block"
+                >
+              </div>
+
+              <span class="absolute top-2 right-2 text-[9.5px] font-mono font-semibold px-1.5 py-0.5 rounded bg-rose-950/90 text-rose-300 border border-rose-800/60 shadow">
+                ${vid.ext.toUpperCase()}
+              </span>
+
+              ${vid.folder ? `
+                <span class="absolute bottom-2 left-2 text-[9px] font-mono px-1.5 py-0.5 rounded bg-black/80 text-zinc-400 border border-zinc-800 truncate max-w-[85%] backdrop-blur">
+                  📁 ${vid.folder}
+                </span>
+              ` : `
+                <span class="absolute bottom-2 left-2 text-[9px] font-mono px-1.5 py-0.5 rounded bg-black/80 text-zinc-500 border border-zinc-800 backdrop-blur">Root</span>
+              `}
+            </div>
+
+            <div class="p-3 space-y-1">
+              <h4 class="text-xs font-semibold text-white font-mono truncate" title="${vid.name}">${vid.name}</h4>
+              <div class="flex items-center justify-between text-[10px] font-mono text-zinc-400">
+                <span>${formatBytes(vid.size)}</span>
+                <span>${vid.last_modified}</span>
               </div>
             </div>
-            <div class="flex items-center gap-8 font-mono">
-              <span class="hidden sm:inline w-20 text-right text-zinc-500">-</span>
-              <span class="hidden md:inline w-32 text-right text-zinc-500">-</span>
-              <div class="w-36 text-right">
-                <button onclick="triggerProcessFolder('${folder.prefix}')" class="px-2 py-1 rounded bg-zinc-800 hover:bg-emerald-600 hover:text-white text-[11px] text-zinc-300 font-medium transition-colors cursor-pointer" title="Process folder">
-                  Process Folder
-                </button>
-              </div>
+
+            <div class="px-3 pb-3 pt-1 border-t border-zinc-800/80 flex items-center justify-between gap-1.5">
+              <button 
+                onclick="openVideoPlayer('${safeKey}', '${safeName}', '${directUrl}')" 
+                class="flex-1 py-1 px-2 rounded-lg bg-blue-950/60 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-800/60 text-[11px] font-semibold flex items-center justify-center gap-1 transition-all cursor-pointer"
+              >
+                <i data-lucide="play" class="w-3 h-3 fill-current"></i>
+                <span>Play</span>
+              </button>
+
+              <button 
+                onclick="triggerProcessSingle('${safeKey}')" 
+                class="flex-1 py-1 px-2 rounded-lg bg-emerald-950/60 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-800/60 text-[11px] font-semibold flex items-center justify-center gap-1 transition-all cursor-pointer"
+              >
+                <i data-lucide="download-cloud" class="w-3 h-3"></i>
+                <span>Process</span>
+              </button>
+
+              <button 
+                onclick="triggerDeleteSingle('${safeKey}')" 
+                class="p-1 rounded-lg text-zinc-500 hover:text-red-400 hover:bg-red-950/50 transition-colors cursor-pointer" 
+                title="Delete from R2"
+              >
+                <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
+              </button>
             </div>
+
           </div>
         `;
       });
 
-      // Render Files
-      files.forEach(file => {
-        const isSelected = selectedFiles.has(file.key);
-        const streamUrl = `/api/media/stream?target=source&key=${encodeURIComponent(file.key)}`;
-        const directUrl = file.url || streamUrl;
-        const safeName = file.name.replace(/'/g, "\\\\'");
-        const safeKey = file.key.replace(/'/g, "\\\\'");
-        const safeUrl = directUrl.replace(/'/g, "\\\\'");
+      container.innerHTML = html;
+      lucide.createIcons();
+    }
 
-        html += `
-          <div class="px-4 py-2 flex items-center justify-between hover:bg-zinc-800/40 transition-colors ${isSelected ? 'bg-blue-950/20' : ''}">
-            <div class="flex items-center gap-3 min-w-0">
-              <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelectFile('${file.key}', this.checked)" class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer">
-              
-              <!-- First Frame Preview Thumbnail in Table -->
-              <div class="w-12 h-8 rounded bg-black border border-zinc-800 overflow-hidden relative shrink-0">
+    function toggleSelectAllVideos() {
+      const allSelected = allVideosData.every(v => selectedFiles.has(v.key));
+      if (allSelected) {
+        selectedFiles.clear();
+      } else {
+        allVideosData.forEach(v => selectedFiles.add(v.key));
+      }
+      renderAllVideosView();
+      updateSelectionUI();
+    }
+
+    // ------------------------------------------------------------
+    // 3. EXPLORER VIEW (HIERARCHY SUBFOLDERS & FILES)
+    // ------------------------------------------------------------
+    async function loadExplorer(prefix = "") {
+      currentPrefix = prefix;
+      selectedFiles.clear();
+      selectedFolders.clear();
+      updateSelectionUI();
+
+      try {
+        const res = await fetch(`/api/files?prefix=${encodeURIComponent(prefix)}`);
+        const json = await res.json();
+        if (json.success) {
+          explorerData = json.data;
+          renderBreadcrumbs();
+          renderExplorerView();
+        }
+      } catch (e) {}
+    }
+
+    function renderBreadcrumbs() {
+      const container = document.getElementById("breadcrumbs");
+      if (!container) return;
+
+      const parts = currentPrefix.split("/").filter(Boolean);
+      let html = `
+        <button onclick="loadExplorer('')" class="hover:text-white font-medium flex items-center gap-1 transition-colors cursor-pointer">
+          <i data-lucide="home" class="w-3.5 h-3.5"></i>
+          <span>Root</span>
+        </button>
+      `;
+
+      let accumulated = "";
+      parts.forEach((part, index) => {
+        accumulated += part + "/";
+        const targetPrefix = accumulated;
+        const isLast = index === parts.length - 1;
+        html += `<span class="text-zinc-600">/</span>`;
+        if (isLast) {
+          html += `<span class="text-white font-semibold">${part}</span>`;
+        } else {
+          html += `<button onclick="loadExplorer('${targetPrefix}')" class="hover:text-white transition-colors cursor-pointer">${part}</button>`;
+        }
+      });
+
+      container.innerHTML = html;
+      lucide.createIcons();
+    }
+
+    function setExplorerLayout(layout) {
+      explorerLayout = layout;
+      const cBtn = document.getElementById("layoutCardsBtn");
+      const tBtn = document.getElementById("layoutTableBtn");
+      if (layout === "cards") {
+        cBtn.className = "p-1.5 rounded-md text-white bg-zinc-800 cursor-pointer";
+        tBtn.className = "p-1.5 rounded-md text-zinc-400 hover:text-white cursor-pointer";
+      } else {
+        cBtn.className = "p-1.5 rounded-md text-zinc-400 hover:text-white cursor-pointer";
+        tBtn.className = "p-1.5 rounded-md text-white bg-zinc-800 cursor-pointer";
+      }
+      renderExplorerView();
+    }
+
+    function renderExplorerView() {
+      const container = document.getElementById("explorerContainer");
+      const search = (document.getElementById("explorerSearch")?.value || "").toLowerCase().trim();
+
+      let folders = explorerData.folders || [];
+      let files = explorerData.files || [];
+
+      if (search) {
+        folders = folders.filter(f => f.name.toLowerCase().includes(search));
+        files = files.filter(f => f.name.toLowerCase().includes(search));
+      }
+
+      if (folders.length === 0 && files.length === 0) {
+        container.innerHTML = `
+          <div class="p-14 text-center text-zinc-500 text-xs bg-zinc-900 border border-zinc-800 rounded-xl space-y-2">
+            <i data-lucide="inbox" class="w-8 h-8 mx-auto text-zinc-600"></i>
+            <div>No items in this directory.</div>
+          </div>
+        `;
+        lucide.createIcons();
+        return;
+      }
+
+      if (explorerLayout === "cards") {
+        let html = `<div class="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 lg:grid-cols-4 gap-4">`;
+
+        // Folder Cards
+        folders.forEach(f => {
+          const isSelected = selectedFolders.has(f.prefix);
+          html += `
+            <div class="bg-zinc-900 border ${isSelected ? 'border-blue-500 bg-blue-950/20' : 'border-zinc-800'} rounded-xl p-3 flex flex-col justify-between hover:border-zinc-700 transition-all shadow-xs group">
+              <div class="flex items-start justify-between gap-2">
+                <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelectFolder('${f.prefix}', this.checked)" class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer mt-1">
+                <div onclick="loadExplorer('${f.prefix}')" class="flex-1 cursor-pointer">
+                  <div class="h-20 rounded-lg bg-zinc-950 border border-zinc-800/80 flex flex-col items-center justify-center text-amber-400 group-hover:scale-102 transition-transform">
+                    <i data-lucide="folder" class="w-8 h-8 fill-amber-400/20"></i>
+                    <span class="text-[10px] text-zinc-500 mt-1 uppercase font-mono font-medium tracking-wider">Subfolder</span>
+                  </div>
+                  <div class="mt-2.5">
+                    <h4 class="text-xs font-semibold text-white group-hover:underline truncate">${f.name}</h4>
+                  </div>
+                </div>
+              </div>
+              <div class="mt-3 pt-2.5 border-t border-zinc-800/80 flex items-center justify-between">
+                <span class="text-[10px] font-mono text-zinc-500">Folder</span>
+                <button onclick="triggerProcessFolder('${f.prefix}')" class="px-2 py-1 rounded bg-zinc-800 hover:bg-emerald-600 hover:text-white text-[11px] text-zinc-300 font-medium transition-colors cursor-pointer">
+                  Process Folder
+                </button>
+              </div>
+            </div>
+          `;
+        });
+
+        // File Cards
+        files.forEach(file => {
+          const isSelected = selectedFiles.has(file.key);
+          const safeKey = file.key.replace(/'/g, "\\\\'");
+          const safeName = file.name.replace(/'/g, "\\\\'");
+          const directUrl = file.direct_url;
+          const streamUrl = file.stream_url;
+
+          html += `
+            <div class="bg-zinc-900 border ${isSelected ? 'border-blue-500 bg-blue-950/20' : 'border-zinc-800'} rounded-xl overflow-hidden flex flex-col justify-between hover:border-zinc-700 transition-all shadow-xs group">
+              <div class="relative w-full aspect-video bg-black overflow-hidden border-b border-zinc-800/80">
                 ${file.is_video ? `
                   <video 
                     src="${directUrl}#t=0.5" 
@@ -1270,104 +1416,212 @@ INDEX_HTML = """
                     onerror="if(!this.dataset.retry){this.dataset.retry='1';this.src='${streamUrl}#t=0.5';}"
                     class="w-full h-full object-cover"
                   ></video>
-                  <div onclick="openVideoPlayer('${safeKey}', '${safeName}', '${safeUrl}')" class="absolute inset-0 bg-black/30 hover:bg-black/0 flex items-center justify-center cursor-pointer">
-                    <i data-lucide="play" class="w-2.5 h-2.5 fill-white text-white"></i>
+                  <div onclick="openVideoPlayer('${safeKey}', '${safeName}', '${directUrl}')" class="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 flex items-center justify-center transition-opacity cursor-pointer">
+                    <div class="w-10 h-10 rounded-full bg-blue-600/90 text-white flex items-center justify-center shadow-lg hover:scale-110 transition-transform">
+                      <i data-lucide="play" class="w-4 h-4 fill-white ml-0.5"></i>
+                    </div>
                   </div>
+                  <span class="absolute top-2 right-2 text-[9.5px] font-mono font-semibold px-1.5 py-0.5 rounded bg-rose-950/90 text-rose-300 border border-rose-800/60 shadow">${file.ext.toUpperCase()}</span>
                 ` : file.is_image ? `
                   <img 
                     src="${directUrl}" 
                     loading="lazy" 
-                    onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${safeUrl}')" 
+                    alt="${file.name}" 
+                    onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${directUrl}')"
                     onerror="if(!this.dataset.retry){this.dataset.retry='1';this.src='${streamUrl}';}"
-                    class="w-full h-full object-cover cursor-pointer"
+                    class="w-full h-full object-cover cursor-pointer hover:scale-105 transition-transform"
                   >
+                  <span class="absolute top-2 right-2 text-[9.5px] font-mono font-semibold px-1.5 py-0.5 rounded bg-blue-950/90 text-blue-300 border border-blue-800/60 shadow">${file.ext.toUpperCase()}</span>
                 ` : `
-                  <div class="w-full h-full flex items-center justify-center text-zinc-500"><i data-lucide="file" class="w-3.5 h-3.5"></i></div>
+                  <div class="w-full h-full flex flex-col items-center justify-center text-zinc-500">
+                    <i data-lucide="file" class="w-8 h-8"></i>
+                    <span class="text-[10px] font-mono mt-1">${file.ext.toUpperCase()}</span>
+                  </div>
                 `}
+
+                <div class="absolute top-2 left-2 z-10 bg-zinc-950/70 p-1 rounded backdrop-blur">
+                  <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelectFile('${file.key}', this.checked)" class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer block">
+                </div>
               </div>
 
-              <!-- Name & Badge -->
-              <div class="truncate flex items-center gap-2">
-                <span class="text-zinc-200 truncate font-mono text-xs">${file.name}</span>
-                <span class="text-[9px] font-mono px-1 py-0.2 rounded border ${file.is_video ? 'bg-rose-950/40 text-rose-300 border-rose-800/60' : 'bg-blue-950/40 text-blue-300 border-blue-800/60'}">${file.ext.toUpperCase()}</span>
+              <div class="p-3 space-y-1">
+                <h4 class="text-xs font-semibold text-white font-mono truncate" title="${file.name}">${file.name}</h4>
+                <div class="flex items-center justify-between text-[10px] font-mono text-zinc-400">
+                  <span>${formatBytes(file.size)}</span>
+                  <span>${file.last_modified}</span>
+                </div>
               </div>
-            </div>
 
-            <!-- Table Columns: Size, Date, Actions -->
-            <div class="flex items-center gap-8 font-mono">
-              <span class="hidden sm:inline w-20 text-right text-zinc-400 text-[11px]">${formatBytes(file.size)}</span>
-              <span class="hidden md:inline w-32 text-right text-zinc-500 text-[11px]">${file.last_modified}</span>
-              <div class="w-36 text-right flex items-center justify-end gap-1.5">
+              <div class="px-3 pb-3 pt-1 border-t border-zinc-800/80 flex items-center justify-between gap-1.5">
                 ${file.is_video ? `
-                  <button 
-                    onclick="openVideoPlayer('${safeKey}', '${safeName}', '${safeUrl}')" 
-                    class="px-2 py-1 rounded bg-blue-950/60 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-800/60 text-[11px] font-semibold flex items-center gap-1 transition-all cursor-pointer"
-                    title="Play Video"
-                  >
-                    <i data-lucide="play" class="w-2.5 h-2.5 fill-current"></i>
+                  <button onclick="openVideoPlayer('${safeKey}', '${safeName}', '${directUrl}')" class="flex-1 py-1 px-2 rounded-lg bg-blue-950/60 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-800/60 text-[11px] font-semibold flex items-center justify-center gap-1 transition-all cursor-pointer">
+                    <i data-lucide="play" class="w-3 h-3 fill-current"></i>
                     <span>Play</span>
                   </button>
-
-                  <button 
-                    onclick="triggerProcessSingle('${safeKey}')" 
-                    class="px-2 py-1 rounded bg-emerald-950/60 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-800/60 text-[11px] font-semibold transition-all cursor-pointer"
-                    title="Process"
-                  >
-                    Process
+                  <button onclick="triggerProcessSingle('${safeKey}')" class="flex-1 py-1 px-2 rounded-lg bg-emerald-950/60 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-800/60 text-[11px] font-semibold flex items-center justify-center gap-1 transition-all cursor-pointer">
+                    <i data-lucide="download-cloud" class="w-3 h-3"></i>
+                    <span>Process</span>
                   </button>
                 ` : file.is_image ? `
-                  <button 
-                    onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${safeUrl}')" 
-                    class="px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-[11px] transition-colors cursor-pointer"
-                  >
-                    View
+                  <button onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${directUrl}')" class="flex-1 py-1 px-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white text-[11px] font-medium flex items-center justify-center gap-1 transition-all cursor-pointer">
+                    <i data-lucide="maximize-2" class="w-3 h-3"></i>
+                    <span>View</span>
                   </button>
                 ` : ''}
 
-                <button 
-                  onclick="triggerDeleteSingle('${safeKey}')" 
-                  class="p-1 rounded hover:bg-red-950/60 text-zinc-500 hover:text-red-400 transition-colors cursor-pointer"
-                  title="Delete"
-                >
+                <button onclick="triggerDeleteSingle('${safeKey}')" class="p-1 rounded-lg text-zinc-500 hover:text-red-400 hover:bg-red-950/50 transition-colors cursor-pointer" title="Delete">
                   <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
                 </button>
               </div>
             </div>
-          </div>
-        `;
-      });
+          `;
+        });
 
-      html += `</div></div>`;
-      container.innerHTML = html;
+        html += `</div>`;
+        container.innerHTML = html;
+      } else {
+        // Table layout
+        let html = `
+          <div class="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden shadow-xs">
+            <div class="bg-zinc-950/80 border-b border-zinc-800 px-4 py-3 flex items-center justify-between text-xs font-medium text-zinc-400 uppercase tracking-wider text-[11px]">
+              <div class="flex items-center gap-3">
+                <input type="checkbox" id="selectAllCheckbox" onchange="toggleSelectAllExplorer(this.checked)" class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer">
+                <span>Item</span>
+              </div>
+              <div class="flex items-center gap-8">
+                <span class="hidden sm:inline w-20 text-right">Size</span>
+                <span class="hidden md:inline w-32 text-right">Last Modified</span>
+                <span class="w-36 text-right">Actions</span>
+              </div>
+            </div>
+            <div class="divide-y divide-zinc-800/60 text-xs">
+        `;
+
+        folders.forEach(f => {
+          const isSelected = selectedFolders.has(f.prefix);
+          html += `
+            <div class="px-4 py-2.5 flex items-center justify-between hover:bg-zinc-800/40 transition-colors ${isSelected ? 'bg-blue-950/20' : ''}">
+              <div class="flex items-center gap-3 min-w-0">
+                <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelectFolder('${f.prefix}', this.checked)" class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer">
+                <div onclick="loadExplorer('${f.prefix}')" class="flex items-center gap-3 cursor-pointer group truncate">
+                  <div class="w-12 h-8 rounded bg-zinc-950 border border-zinc-800 flex items-center justify-center text-amber-400 shrink-0">
+                    <i data-lucide="folder" class="w-4 h-4 fill-amber-400/20"></i>
+                  </div>
+                  <span class="font-medium text-white group-hover:underline truncate">${f.name}</span>
+                  <span class="text-[9.5px] font-mono px-1.5 py-0.2 rounded bg-zinc-800 text-zinc-400 border border-zinc-700">DIR</span>
+                </div>
+              </div>
+              <div class="flex items-center gap-8 font-mono">
+                <span class="hidden sm:inline w-20 text-right text-zinc-500">-</span>
+                <span class="hidden md:inline w-32 text-right text-zinc-500">-</span>
+                <div class="w-36 text-right">
+                  <button onclick="triggerProcessFolder('${f.prefix}')" class="px-2 py-1 rounded bg-zinc-800 hover:bg-emerald-600 hover:text-white text-[11px] text-zinc-300 font-medium transition-colors cursor-pointer">
+                    Process Folder
+                  </button>
+                </div>
+              </div>
+            </div>
+          `;
+        });
+
+        files.forEach(file => {
+          const isSelected = selectedFiles.has(file.key);
+          const safeKey = file.key.replace(/'/g, "\\\\'");
+          const safeName = file.name.replace(/'/g, "\\\\'");
+          const directUrl = file.direct_url;
+          const streamUrl = file.stream_url;
+
+          html += `
+            <div class="px-4 py-2 flex items-center justify-between hover:bg-zinc-800/40 transition-colors ${isSelected ? 'bg-blue-950/20' : ''}">
+              <div class="flex items-center gap-3 min-w-0">
+                <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleSelectFile('${file.key}', this.checked)" class="rounded bg-zinc-800 border-zinc-700 text-blue-500 focus:ring-0 cursor-pointer">
+                
+                <div class="w-12 h-8 rounded bg-black border border-zinc-800 overflow-hidden relative shrink-0">
+                  ${file.is_video ? `
+                    <video src="${directUrl}#t=0.5" preload="metadata" muted playsinline onloadedmetadata="try{if(this.currentTime===0)this.currentTime=0.5;}catch(e){}" class="w-full h-full object-cover"></video>
+                    <div onclick="openVideoPlayer('${safeKey}', '${safeName}', '${directUrl}')" class="absolute inset-0 bg-black/30 hover:bg-black/0 flex items-center justify-center cursor-pointer">
+                      <i data-lucide="play" class="w-2.5 h-2.5 fill-white text-white"></i>
+                    </div>
+                  ` : file.is_image ? `
+                    <img src="${directUrl}" loading="lazy" onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${directUrl}')" class="w-full h-full object-cover cursor-pointer" onerror="this.src='${streamUrl}';">
+                  ` : `
+                    <div class="w-full h-full flex items-center justify-center text-zinc-500"><i data-lucide="file" class="w-3.5 h-3.5"></i></div>
+                  `}
+                </div>
+
+                <div class="truncate flex items-center gap-2">
+                  <span class="text-zinc-200 truncate font-mono text-xs">${file.name}</span>
+                  <span class="text-[9px] font-mono px-1 py-0.2 rounded border ${file.is_video ? 'bg-rose-950/40 text-rose-300 border-rose-800/60' : 'bg-blue-950/40 text-blue-300 border-blue-800/60'}">${file.ext.toUpperCase()}</span>
+                </div>
+              </div>
+
+              <div class="flex items-center gap-8 font-mono">
+                <span class="hidden sm:inline w-20 text-right text-zinc-400 text-[11px]">${formatBytes(file.size)}</span>
+                <span class="hidden md:inline w-32 text-right text-zinc-500 text-[11px]">${file.last_modified}</span>
+                <div class="w-36 text-right flex items-center justify-end gap-1.5">
+                  ${file.is_video ? `
+                    <button onclick="openVideoPlayer('${safeKey}', '${safeName}', '${directUrl}')" class="px-2 py-1 rounded bg-blue-950/60 hover:bg-blue-600 text-blue-300 hover:text-white border border-blue-800/60 text-[11px] font-semibold flex items-center gap-1 transition-all cursor-pointer">
+                      <i data-lucide="play" class="w-2.5 h-2.5 fill-current"></i>
+                      <span>Play</span>
+                    </button>
+                    <button onclick="triggerProcessSingle('${safeKey}')" class="px-2 py-1 rounded bg-emerald-950/60 hover:bg-emerald-600 text-emerald-300 hover:text-white border border-emerald-800/60 text-[11px] font-semibold transition-all cursor-pointer">Process</button>
+                  ` : file.is_image ? `
+                    <button onclick="openImageModal('${safeKey}', '${safeName}', 'source', '${directUrl}')" class="px-2 py-1 rounded bg-zinc-800 hover:bg-zinc-700 text-zinc-300 text-[11px] transition-colors cursor-pointer">View</button>
+                  ` : ''}
+                  <button onclick="triggerDeleteSingle('${safeKey}')" class="p-1 rounded hover:bg-red-950/60 text-zinc-500 hover:text-red-400 transition-colors cursor-pointer" title="Delete"><i data-lucide="trash-2" class="w-3.5 h-3.5"></i></button>
+                </div>
+              </div>
+            </div>
+          `;
+        });
+
+        html += `</div></div>`;
+        container.innerHTML = html;
+      }
+
+      lucide.createIcons();
+    }
+
+    function toggleSelectAllExplorer(isChecked) {
+      if (isChecked) {
+        explorerData.folders.forEach(f => selectedFolders.add(f.prefix));
+        explorerData.files.forEach(f => selectedFiles.add(f.key));
+      } else {
+        selectedFolders.clear();
+        selectedFiles.clear();
+      }
+      renderExplorerView();
+      updateSelectionUI();
     }
 
     // ------------------------------------------------------------
-    // 3. DESTINATION THUMBNAILS GALLERY LOGIC (NEW MENU)
+    // 4. DESTINATION THUMBNAILS
     // ------------------------------------------------------------
     async function loadThumbnails() {
-      const container = document.getElementById("thumbnailsContainer");
-      container.innerHTML = `<div class="col-span-full p-12 text-center text-zinc-500 text-xs">Loading thumbnails from Destination R2...</div>`;
+      const container = document.getElementById("thumbnailsGrid");
+      container.innerHTML = `<div class="col-span-full p-12 text-center text-zinc-500 text-xs">Loading thumbnails...</div>`;
 
       try {
         const res = await fetch("/api/thumbnails");
         const json = await res.json();
         if (json.success) {
           thumbnailsData = json.thumbnails || [];
-          document.getElementById("tabDestCountBadge").innerText = thumbnailsData.length;
-          document.getElementById("statThumbsCount").innerText = thumbnailsData.length;
           renderThumbnailsView();
         } else {
-          container.innerHTML = `<div class="col-span-full p-8 text-center text-red-400 text-xs">Failed to load thumbnails: ${json.error}</div>`;
+          container.innerHTML = `<div class="col-span-full p-8 text-center text-red-400 text-xs">${json.error}</div>`;
         }
-      } catch (err) {
-        container.innerHTML = `<div class="col-span-full p-8 text-center text-red-400 text-xs">Error connecting to server: ${err}</div>`;
+      } catch (e) {
+        container.innerHTML = `<div class="col-span-full p-8 text-center text-red-400 text-xs">Error: ${e}</div>`;
       }
     }
 
-    function renderThumbnailsView() {
-      const container = document.getElementById("thumbnailsContainer");
-      const search = (document.getElementById("thumbSearchFilter")?.value || "").toLowerCase().trim();
+    function filterThumbnails() {
+      renderThumbnailsView();
+    }
 
+    function renderThumbnailsView() {
+      const container = document.getElementById("thumbnailsGrid");
+      const search = (document.getElementById("thumbsSearch")?.value || "").toLowerCase().trim();
       let filtered = thumbnailsData;
       if (search) {
         filtered = filtered.filter(t => t.name.toLowerCase().includes(search) || t.key.toLowerCase().includes(search));
@@ -1386,22 +1640,19 @@ INDEX_HTML = """
 
       let html = "";
       filtered.forEach(thumb => {
-        const streamUrl = `/api/media/stream?target=dest&key=${encodeURIComponent(thumb.key)}`;
-        const directUrl = thumb.url || streamUrl;
         const safeKey = thumb.key.replace(/'/g, "\\\\'");
         const safeName = thumb.name.replace(/'/g, "\\\\'");
-        const safeUrl = directUrl.replace(/'/g, "\\\\'");
+        const directUrl = thumb.direct_url;
+        const streamUrl = thumb.stream_url;
 
         html += `
           <div class="bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden flex flex-col justify-between hover:border-amber-500/50 transition-all shadow-xs group">
-            
-            <!-- Thumbnail Image Container -->
             <div class="relative w-full aspect-video bg-black overflow-hidden border-b border-zinc-800/80">
               <img 
                 src="${directUrl}" 
                 loading="lazy" 
                 alt="${thumb.name}" 
-                onclick="openImageModal('${safeKey}', '${safeName}', 'dest', '${safeUrl}')"
+                onclick="openImageModal('${safeKey}', '${safeName}', 'dest', '${directUrl}')"
                 onerror="if(!this.dataset.retry){this.dataset.retry='1';this.src='${streamUrl}';}"
                 class="w-full h-full object-cover cursor-pointer group-hover:scale-104 transition-transform"
               >
@@ -1410,21 +1661,17 @@ INDEX_HTML = """
               </span>
             </div>
 
-            <!-- Details -->
-            <div class="p-3 space-y-1.5">
-              <div class="flex items-center justify-between">
-                <span class="text-xs font-semibold text-white font-mono truncate" title="${thumb.name}">${thumb.name}</span>
-              </div>
+            <div class="p-3 space-y-1">
+              <h4 class="text-xs font-semibold text-white font-mono truncate" title="${thumb.name}">${thumb.name}</h4>
               <div class="flex items-center justify-between text-[10px] font-mono text-zinc-400">
                 <span>${formatBytes(thumb.size)}</span>
                 <span>${thumb.last_modified}</span>
               </div>
             </div>
 
-            <!-- Actions -->
             <div class="px-3 pb-3 pt-1 border-t border-zinc-800/80 flex items-center justify-between gap-1.5">
               <button 
-                onclick="openImageModal('${safeKey}', '${safeName}', 'dest', '${safeUrl}')" 
+                onclick="openImageModal('${safeKey}', '${safeName}', 'dest', '${directUrl}')" 
                 class="flex-1 py-1 px-2 rounded-lg bg-zinc-800 hover:bg-zinc-700 text-zinc-300 hover:text-white text-[11px] font-medium flex items-center justify-center gap-1 transition-all cursor-pointer"
               >
                 <i data-lucide="maximize-2" class="w-3 h-3"></i>
@@ -1437,18 +1684,17 @@ INDEX_HTML = """
                 title="Copy relative thumbnail path"
               >
                 <i data-lucide="copy" class="w-3 h-3"></i>
-                <span>Copy Path</span>
+                <span>Copy</span>
               </button>
 
               <button 
                 onclick="deleteThumbnail('${safeKey}')" 
                 class="p-1 rounded-lg text-zinc-500 hover:text-red-400 hover:bg-red-950/50 transition-colors cursor-pointer" 
-                title="Delete thumbnail from Destination R2"
+                title="Delete from Destination R2"
               >
                 <i data-lucide="trash-2" class="w-3.5 h-3.5"></i>
               </button>
             </div>
-
           </div>
         `;
       });
@@ -1458,7 +1704,7 @@ INDEX_HTML = """
     }
 
     async function deleteThumbnail(key) {
-      if (!confirm(`Are you sure you want to permanently delete thumbnail: ${key}?`)) return;
+      if (!confirm(`Delete thumbnail: ${key}?`)) return;
       try {
         const res = await fetch("/api/thumbnails/delete", {
           method: "POST",
@@ -1468,7 +1714,7 @@ INDEX_HTML = """
         const json = await res.json();
         if (json.success) {
           loadThumbnails();
-          loadBucketStats();
+          loadStats();
         } else {
           alert("Error: " + (json.error || "Failed to delete thumbnail"));
         }
@@ -1477,83 +1723,8 @@ INDEX_HTML = """
       }
     }
 
-    function copyPathToClipboard(text) {
-      navigator.clipboard.writeText(text).then(() => {
-        showToast(`Copied path: ${text}`);
-      }).catch(err => {
-        prompt("Copy path:", text);
-      });
-    }
-
-    function showToast(msg) {
-      const toast = document.getElementById("copyToast");
-      const text = document.getElementById("copyToastText");
-      text.innerText = msg;
-      toast.classList.remove("opacity-0", "translate-y-3", "pointer-events-none");
-      setTimeout(() => {
-        toast.classList.add("opacity-0", "translate-y-3", "pointer-events-none");
-      }, 2500);
-    }
-
     // ------------------------------------------------------------
-    // 4. VIDEO PLAYER MODAL (PLAY ACTION)
-    // ------------------------------------------------------------
-    function openVideoPlayer(key, name, url = "") {
-      currentlyPlayingKey = key;
-      const modal = document.getElementById("videoModal");
-      const player = document.getElementById("mainVideoPlayer");
-      const title = document.getElementById("videoModalTitle");
-      const keyText = document.getElementById("videoModalKeyText");
-
-      title.innerText = name || key;
-      keyText.innerText = `R2 Key: ${key}`;
-
-      player.src = url || `/api/media/stream?target=source&key=${encodeURIComponent(key)}`;
-      modal.classList.remove("hidden");
-      player.load();
-      player.play().catch(e => console.log("Autoplay notice:", e));
-      lucide.createIcons();
-    }
-
-    function closeVideoPlayer() {
-      const modal = document.getElementById("videoModal");
-      const player = document.getElementById("mainVideoPlayer");
-      modal.classList.add("hidden");
-      player.pause();
-      player.src = "";
-      currentlyPlayingKey = "";
-    }
-
-    function processCurrentPlayingVideo() {
-      if (!currentlyPlayingKey) return;
-      const key = currentlyPlayingKey;
-      closeVideoPlayer();
-      triggerProcessSingle(key);
-    }
-
-    // ------------------------------------------------------------
-    // 5. IMAGE LIGHTBOX MODAL
-    // ------------------------------------------------------------
-    function openImageModal(key, name, target = "source", url = "") {
-      const modal = document.getElementById("imageModal");
-      const img = document.getElementById("imageModalEl");
-      const title = document.getElementById("imageModalTitle");
-
-      title.innerText = name || key;
-      img.src = url || `/api/media/stream?target=${target}&key=${encodeURIComponent(key)}`;
-      modal.classList.remove("hidden");
-      lucide.createIcons();
-    }
-
-    function closeImageModal() {
-      const modal = document.getElementById("imageModal");
-      const img = document.getElementById("imageModalEl");
-      modal.classList.add("hidden");
-      img.src = "";
-    }
-
-    // ------------------------------------------------------------
-    // 6. SELECTION & PROCESS ACTIONS
+    // SELECTION & PROCESS ACTIONS
     // ------------------------------------------------------------
     function toggleSelectFolder(prefix, isChecked) {
       if (isChecked) selectedFolders.add(prefix);
@@ -1567,35 +1738,31 @@ INDEX_HTML = """
       updateSelectionUI();
     }
 
-    function toggleSelectAll(isChecked) {
-      if (isChecked) {
-        directoryData.folders.forEach(f => selectedFolders.add(f.prefix));
-        directoryData.files.forEach(f => selectedFiles.add(f.key));
-      } else {
-        selectedFolders.clear();
-        selectedFiles.clear();
-      }
-      renderSourceView();
-      updateSelectionUI();
-    }
-
     function clearSelection() {
       selectedFolders.clear();
       selectedFiles.clear();
-      const chk = document.getElementById("selectAllCheckbox");
-      if (chk) chk.checked = false;
-      renderSourceView();
       updateSelectionUI();
+      if (activeTab === "explorer") renderExplorerView();
+      else if (activeTab === "images") renderAllImagesView();
+      else if (activeTab === "videos") renderAllVideosView();
     }
 
     function updateSelectionUI() {
       const header = document.getElementById("selectionHeader");
       const text = document.getElementById("selectedCountText");
+      const processBtn = document.getElementById("batchProcessBtn");
       const total = selectedFolders.size + selectedFiles.size;
 
       if (total > 0) {
         header.classList.remove("hidden");
         text.innerText = `${total} item(s) selected (${selectedFolders.size} folder${selectedFolders.size === 1 ? '' : 's'}, ${selectedFiles.size} file${selectedFiles.size === 1 ? '' : 's'})`;
+        
+        // Hide Process button if on Images view
+        if (activeTab === "images") {
+          processBtn?.classList.add("hidden");
+        } else {
+          processBtn?.classList.remove("hidden");
+        }
       } else {
         header.classList.add("hidden");
       }
@@ -1641,13 +1808,13 @@ INDEX_HTML = """
     }
 
     // ------------------------------------------------------------
-    // 7. DELETE OPERATIONS
+    // DELETE OPERATIONS
     // ------------------------------------------------------------
     function openDeleteModal() {
       const modal = document.getElementById("deleteModal");
       const summary = document.getElementById("deleteSummaryText");
       const total = selectedFolders.size + selectedFiles.size;
-      summary.innerText = `Are you sure you want to permanently delete ${total} selected item(s) from Source R2? This action cannot be undone.`;
+      summary.innerText = `Are you sure you want to permanently delete ${total} selected item(s) from Source R2?`;
       modal.classList.remove("hidden");
     }
 
@@ -1678,8 +1845,11 @@ INDEX_HTML = """
         const json = await res.json();
         if (json.success) {
           clearSelection();
-          loadDirectory(currentPrefix);
-          loadBucketStats();
+          if (activeTab === "explorer") loadExplorer(currentPrefix);
+          else if (activeTab === "images") loadAllImages();
+          else if (activeTab === "videos") loadAllVideos();
+          loadStats();
+          showToast(`Deleted ${json.deleted_count} item(s)!`);
         } else {
           alert(json.error || "Failed to delete items.");
         }
@@ -1689,8 +1859,59 @@ INDEX_HTML = """
     }
 
     // ------------------------------------------------------------
-    // 8. TASK MONITORING
+    // MODALS: VIDEO PLAYER, IMAGE LIGHTBOX, TASKS
     // ------------------------------------------------------------
+    function openVideoPlayer(key, name, url = "") {
+      currentlyPlayingKey = key;
+      const modal = document.getElementById("videoModal");
+      const player = document.getElementById("mainVideoPlayer");
+      const title = document.getElementById("videoModalTitle");
+      const keyText = document.getElementById("videoModalKeyText");
+
+      title.innerText = name || key;
+      keyText.innerText = `R2 Key: ${key}`;
+
+      player.src = url || `/api/media/stream?target=source&key=${encodeURIComponent(key)}`;
+      modal.classList.remove("hidden");
+      player.load();
+      player.play().catch(e => console.log("Autoplay notice:", e));
+      lucide.createIcons();
+    }
+
+    function closeVideoPlayer() {
+      const modal = document.getElementById("videoModal");
+      const player = document.getElementById("mainVideoPlayer");
+      modal.classList.add("hidden");
+      player.pause();
+      player.src = "";
+      currentlyPlayingKey = "";
+    }
+
+    function processCurrentPlayingVideo() {
+      if (!currentlyPlayingKey) return;
+      const key = currentlyPlayingKey;
+      closeVideoPlayer();
+      triggerProcessSingle(key);
+    }
+
+    function openImageModal(key, name, target = "source", url = "") {
+      const modal = document.getElementById("imageModal");
+      const img = document.getElementById("imageModalEl");
+      const title = document.getElementById("imageModalTitle");
+
+      title.innerText = name || key;
+      img.src = url || `/api/media/stream?target=${target}&key=${encodeURIComponent(key)}`;
+      modal.classList.remove("hidden");
+      lucide.createIcons();
+    }
+
+    function closeImageModal() {
+      const modal = document.getElementById("imageModal");
+      const img = document.getElementById("imageModalEl");
+      modal.classList.add("hidden");
+      img.src = "";
+    }
+
     function openTaskModal() {
       document.getElementById("taskModal").classList.remove("hidden");
       pollTaskStatus();
@@ -1729,12 +1950,27 @@ INDEX_HTML = """
           logsBox.innerText = data.logs.join("\\n");
           logsBox.scrollTop = logsBox.scrollHeight;
         }
-      } catch (e) {
-        // silent
-      }
+      } catch (e) {}
     }
 
-    // Keyboard shortcuts: ESC closes modals
+    function copyPathToClipboard(text) {
+      navigator.clipboard.writeText(text).then(() => {
+        showToast(`Copied path: ${text}`);
+      }).catch(err => {
+        prompt("Copy path:", text);
+      });
+    }
+
+    function showToast(msg) {
+      const toast = document.getElementById("copyToast");
+      const text = document.getElementById("copyToastText");
+      text.innerText = msg;
+      toast.classList.remove("opacity-0", "translate-y-3", "pointer-events-none");
+      setTimeout(() => {
+        toast.classList.add("opacity-0", "translate-y-3", "pointer-events-none");
+      }, 2500);
+    }
+
     window.addEventListener("keydown", (e) => {
       if (e.key === "Escape") {
         closeVideoPlayer();
@@ -1744,15 +1980,14 @@ INDEX_HTML = """
       }
     });
 
-    // Auto poll task status every 3 seconds
     setInterval(() => {
       pollTaskStatus();
+      loadStats();
     }, 3000);
 
-    // Initial load
     window.addEventListener("DOMContentLoaded", () => {
-      loadDirectory("");
-      loadBucketStats();
+      loadStats();
+      loadExplorer("");
       lucide.createIcons();
     });
   </script>
